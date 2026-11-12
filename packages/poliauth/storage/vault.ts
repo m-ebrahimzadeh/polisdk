@@ -1,7 +1,7 @@
 import type { SavedVaultCredentials, IdentityId } from '../domain/entities.js';
 import { mergeVaultCredentials } from '../domain/credentials.js';
 import type { EncryptedPayload, VaultMetadata } from '../interfaces/crypto-port.js';
-import type { VaultStoragePort, UserVaultStorageFactoryPort } from '../interfaces/storage-port.js';
+import type { VaultStoragePort, UserVaultStorageFactoryPort, VaultSecretMaterialPort } from '../interfaces/storage-port.js';
 import type { AuthLoggerPort } from '../interfaces/logger-port.js';
 
 export const VAULT_STORAGE_KEY = 'poliauth_credentials_vault_v1';
@@ -170,7 +170,9 @@ async function encryptJsonValue(
   secretMaterial?: string
 ): Promise<void> {
   const webCrypto = getWebCrypto();
-  const effectiveSecret = secretMaterial ?? storage.getSecretMaterial?.();
+  const effectiveSecret =
+    secretMaterial ??
+    (storage as Partial<VaultSecretMaterialPort>).getSecretMaterial?.();
   const salt = await getOrCreateSalt(storage, metaKey);
   const iv = webCrypto.getRandomValues(new Uint8Array(IV_BYTES));
   const key = await deriveAesKey(salt, domain, effectiveSecret);
@@ -212,7 +214,9 @@ async function decryptJsonValue<T>(
   }
 
   try {
-    const effectiveSecret = options?.secretMaterial ?? storage.getSecretMaterial?.();
+    const effectiveSecret =
+      options?.secretMaterial ??
+      (storage as Partial<VaultSecretMaterialPort>).getSecretMaterial?.();
     const salt = base64ToBytes(meta.salt);
     const iv = base64ToBytes(payload.iv);
     const ciphertext = base64ToBytes(payload.ciphertext);

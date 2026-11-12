@@ -18,7 +18,7 @@ import type {
   UserVaultStorageFactoryPort,
   UserIdentityRepositoryPort
 } from '../interfaces/storage-port.js';
-import type { SessionContextPoolPort } from '../interfaces/browser-driver-port.js';
+import type { SessionContextPoolPort } from '../interfaces/session-pool-port.js';
 import type { AuthLoggerPort } from '../interfaces/logger-port.js';
 import {
   EncryptedCredentialVault,

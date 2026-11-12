@@ -1,16 +1,16 @@
 /**
  * @module @polisdk/poliauth/interfaces/authorization-port
- * Access Control and Resource Authorization Ports.
+ * Segregated Access Control and Resource Authorization Ports.
  */
 
 import type { AuthSubject, IdentityId } from '../domain/entities.js';
+import type { MaybePromise } from './maybe-promise.js';
 
 export type DenialReasonCode =
   | 'NON_PRIVATE_CHANNEL'
   | 'UNAUTHENTICATED_SUBJECT'
   | 'NOT_IN_ALLOWLIST'
   | 'ADMIN_REQUIRED'
-  | 'VAULT_NOT_CONFIGURED'
   | 'RESOURCE_FORBIDDEN';
 
 export interface AuthorizationDecision {
@@ -27,28 +27,47 @@ export interface ResourceDescriptor {
 }
 
 /**
- * Pluggable policy port for evaluating resource-level ownership or access rights.
+ * Request evaluated by `AccessEvaluatorPort`.
  */
-export interface ResourceAuthorizationPolicyPort {
-  isResourceAuthorized(
-    userId: IdentityId,
-    resource: ResourceDescriptor
-  ): Promise<boolean> | boolean;
+export interface AccessEvaluationRequest {
+  userId?: IdentityId | null;
+  isPrivateChannel?: boolean;
+  requireAdmin?: boolean;
 }
 
 /**
- * Port for evaluating subject and channel access control rules.
+ * Pluggable policy port for evaluating resource-level ownership or access rights.
  */
-export interface AuthorizationServicePort {
+export interface ResourceAuthorizationPolicyPort {
+  isResourceAuthorized(userId: IdentityId, resource: ResourceDescriptor): MaybePromise<boolean>;
+}
+
+/**
+ * Channel privacy + allowlist/admin access evaluation (the only role needed by middleware).
+ */
+export interface AccessEvaluatorPort {
+  evaluateChannelAndUserAccess(request: AccessEvaluationRequest): AuthorizationDecision;
+}
+
+/**
+ * Subject role queries.
+ */
+export interface SubjectRoleQueryPort {
   isUserAllowed(userId: IdentityId): boolean;
   isAdmin(userId: IdentityId): boolean;
-  evaluateChannelAndUserAccess(params: {
-    userId?: IdentityId | null;
-    isPrivateChannel?: boolean;
-    requireAdmin?: boolean;
-  }): AuthorizationDecision;
-  authorizeResource(
-    userId: IdentityId,
-    resource: ResourceDescriptor
-  ): Promise<AuthorizationDecision>;
 }
+
+/**
+ * Resource-level authorization.
+ */
+export interface ResourceAuthorizerPort {
+  authorizeResource(userId: IdentityId, resource: ResourceDescriptor): Promise<AuthorizationDecision>;
+}
+
+/**
+ * Full authorization service contract (implemented by `AuthorizationService`).
+ */
+export interface AuthorizationServicePort
+  extends AccessEvaluatorPort,
+    SubjectRoleQueryPort,
+    ResourceAuthorizerPort {}

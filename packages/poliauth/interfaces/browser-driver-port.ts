@@ -1,11 +1,19 @@
 /**
  * @module @polisdk/poliauth/interfaces/browser-driver-port
- * Browser Automation and Session Pool Ports.
+ * Segregated Browser Page Driver Ports (Interface Segregation Principle).
+ *
+ * Role interfaces:
+ * - `PageNavigationPort`          — navigation primitives shared by every driver.
+ * - `PolimiIdpPagePort`           — Politecnico di Milano IdP page capabilities (credentials, 2FA, recovery).
+ * - `AuthPageDriverPort`          — core driver = navigation + PoliMi IdP (required by `authenticate`).
+ * - `FederatedSsoPageDriverPort`  — optional federated SAML Service Provider capabilities.
+ * - `FederatedAuthPageDriverPort` — core driver + federated SP (required by `authenticateFederatedSaml`).
+ *
+ * No port in this module references any concrete Service Provider (Webex, Zoom, ...).
  */
 
 import type {
   FederatedSsoInspectionResult,
-  IdentityId,
   PolimiStageInspectionResult
 } from '../domain/entities.js';
 
@@ -20,9 +28,41 @@ export interface PageLocationSnapshot {
 }
 
 /**
- * Driver port abstracting a single browser page/tab during authentication.
+ * Result of a single page interaction (form fill + submit).
  */
-export interface AuthPageDriverPort {
+export interface PageActionResult {
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * Result of recovering from a PoliMi `SessioneTerminata` / security-violation page.
+ */
+export interface SessionRecoveryResult {
+  ok: boolean;
+  navigatedTo: string;
+}
+
+/**
+ * Credentials submitted on the PoliMi IdP credentials form.
+ */
+export interface PolimiCredentialSubmission {
+  personCode: string;
+  password: string;
+  stayConnected?: boolean;
+}
+
+/**
+ * 6-digit OTP submitted on the PoliMi IdP 2FA form.
+ */
+export interface PolimiOtpSubmission {
+  otp: string;
+}
+
+/**
+ * Navigation primitives shared by every page driver.
+ */
+export interface PageNavigationPort {
   /**
    * Navigates the underlying page/tab to the given URL.
    */
@@ -32,7 +72,12 @@ export interface AuthPageDriverPort {
    * Waits for an in-flight navigation or page load to settle.
    */
   waitForNavigation(timeoutMs?: number): Promise<void>;
+}
 
+/**
+ * Politecnico di Milano Identity Provider page capabilities.
+ */
+export interface PolimiIdpPagePort {
   /**
    * Inspects the current PoliMi authentication stage (`authenticated`, `otp`,
    * `credentials`, `sso_handoff`, `session_expired`, or `unknown`).
@@ -42,70 +87,54 @@ export interface AuthPageDriverPort {
   /**
    * Recovers from bare `/aunicalogin/` security violation or expired session pages.
    */
-  recoverSessionPage(): Promise<{ ok: boolean; navigatedTo: string }>;
+  recoverSessionPage(): Promise<SessionRecoveryResult>;
 
   /**
    * Populates Person Code and Password and submits the PoliMi login form.
    */
-  submitCredentials(params: {
-    personCode: string;
-    password: string;
-    stayConnected?: boolean;
-  }): Promise<{ ok: boolean; error?: string }>;
+  submitCredentials(params: PolimiCredentialSubmission): Promise<PageActionResult>;
 
   /**
    * Populates the 6-digit 2FA OTP and submits `#form_scelta2fa`.
    */
-  submitOtp(params: { otp: string }): Promise<{ ok: boolean; error?: string }>;
-
-  /**
-   * Inspects whether the page is on a federated SAML SSO login prompt.
-   */
-  inspectFederatedSsoPage?(): Promise<FederatedSsoInspectionResult>;
-
-  /**
-   * Submits the user's institutional email on a federated SAML SSO discovery page.
-   */
-  submitFederatedEmailLogin?(
-    email: string
-  ): Promise<{ ok: boolean; error?: string }>;
+  submitOtp(params: PolimiOtpSubmission): Promise<PageActionResult>;
 }
 
 /**
- * Managed per-user browser session entry with reference-counted lock protection.
+ * Core authentication page driver: navigation + PoliMi IdP capabilities.
+ * This is the only driver contract required by `PoliAuthOrchestrator.authenticate`.
  */
-export interface ManagedSessionContext<TContext = unknown, TPage = unknown> {
-  userId: IdentityId;
-  context: TContext;
-  primaryPage: TPage | null;
-  lastActiveAt: number;
-  activeLocks: number;
-}
+export interface AuthPageDriverPort extends PageNavigationPort, PolimiIdpPagePort {}
 
-export interface SessionPoolStats {
-  activeContexts: number;
-  busyContexts: number;
-  browserConnected: boolean;
+/**
+ * Federated SAML 2.0 Service Provider page capabilities.
+ *
+ * Implementations delegate SP-specific DOM knowledge to a pluggable
+ * `FederatedSsoProviderAdapterPort` (or its serialisable `FederatedSsoProviderSpec`),
+ * so new providers can be added without modifying this port or the orchestrator.
+ */
+export interface FederatedSsoPageDriverPort {
+  /**
+   * Identifier of the federated SSO provider this driver is bound to (e.g. `'webex'`).
+   */
+  readonly federatedProviderId: string;
+
+  /**
+   * Classifies the current page from the federated Service Provider's perspective.
+   */
+  inspectFederatedSsoPage(): Promise<FederatedSsoInspectionResult>;
+
+  /**
+   * Submits the user's identifier (institutional email / username) on the SP's
+   * identifier-discovery prompt.
+   */
+  submitFederatedIdentifier(identifier: string): Promise<PageActionResult>;
 }
 
 /**
- * Port for managing isolated, reference-counted per-user browser contexts
- * with idle TTL eviction and encrypted session state persistence.
+ * Driver contract required by `PoliAuthOrchestrator.authenticateFederatedSaml`:
+ * the core PoliMi IdP driver plus a bound federated Service Provider.
  */
-export interface SessionContextPoolPort<TContext = unknown, TPage = unknown> {
-  acquireUserContext(
-    userId: IdentityId
-  ): Promise<ManagedSessionContext<TContext, TPage>>;
-  releaseUserContext(userId: IdentityId): void;
-  getOrCreatePrimaryPage(
-    managed: ManagedSessionContext<TContext, TPage>
-  ): Promise<TPage>;
-  saveUserContextState(userId: IdentityId): Promise<void>;
-  destroyUserContext(
-    userId: IdentityId,
-    options?: { skipSaveState?: boolean; clearPersistedState?: boolean }
-  ): Promise<void>;
-  evictExpiredContexts(): Promise<void>;
-  getStats(): SessionPoolStats;
-  closeAll(): Promise<void>;
-}
+export interface FederatedAuthPageDriverPort
+  extends AuthPageDriverPort,
+    FederatedSsoPageDriverPort {}

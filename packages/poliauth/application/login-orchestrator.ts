@@ -12,7 +12,11 @@ import type {
   LoginFlowStatus
 } from '../domain/entities.js';
 import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
-import type { AuthPageDriverPort } from '../interfaces/browser-driver-port.js';
+import type {
+  AuthPageDriverPort,
+  FederatedAuthPageDriverPort,
+  FederatedSsoPageDriverPort
+} from '../interfaces/browser-driver-port.js';
 import type {
   LoginProgressCallbacks,
   OtpChallengeProviderPort
@@ -50,7 +54,9 @@ export interface PolimiSessionAuthOutcome {
 
 export interface FederatedSamlAuthRequest {
   userId: IdentityId;
-  driver: AuthPageDriverPort;
+  driver:
+    | FederatedAuthPageDriverPort
+    | (AuthPageDriverPort & Partial<FederatedSsoPageDriverPort>);
   credentials: Partial<LoginCredentials>;
   /** Poll interval in milliseconds. Default: 250. */
   pollIntervalMs?: number;
@@ -251,7 +257,9 @@ export class PoliAuthOrchestrator {
    */
   public async handleFederatedSamlStep(params: {
     userId: IdentityId;
-    driver: AuthPageDriverPort;
+    driver:
+    | FederatedAuthPageDriverPort
+    | (AuthPageDriverPort & Partial<FederatedSsoPageDriverPort>);
     credentials: Partial<LoginCredentials>;
     state: {
       submittedEmail: boolean;
@@ -336,14 +344,15 @@ export class PoliAuthOrchestrator {
     }
 
     // 4. Check Federated SSO state
-    if (!driver.inspectFederatedSsoPage) {
+    const fedDriver = driver as Partial<FederatedSsoPageDriverPort>;
+    if (!fedDriver.inspectFederatedSsoPage) {
       return {
         action: 'login_required',
         reason: 'Driver does not support federated SSO page inspection.'
       };
     }
 
-    const ssoInspection = await driver.inspectFederatedSsoPage().catch(() => null);
+    const ssoInspection = await fedDriver.inspectFederatedSsoPage().catch(() => null);
     if (!ssoInspection) {
       return { action: 'continue_polling' };
     }
@@ -352,7 +361,11 @@ export class PoliAuthOrchestrator {
       return { action: 'authenticated_or_ready' };
     }
 
-    if (ssoInspection.isEmailSsoPage && !state.submittedEmail) {
+    const isPrompt =
+      ssoInspection.isIdentifierPrompt ||
+      Boolean((ssoInspection as unknown as { isEmailSsoPage?: boolean }).isEmailSsoPage);
+
+    if (isPrompt && !state.submittedEmail) {
       const email = (credentials.polimiEmail || '').trim();
       if (!email) {
         return {
@@ -362,16 +375,20 @@ export class PoliAuthOrchestrator {
         };
       }
 
-      if (!driver.submitFederatedEmailLogin) {
+      const submitFn =
+        fedDriver.submitFederatedIdentifier ??
+        (fedDriver as unknown as { submitFederatedEmailLogin?: (email: string) => Promise<{ ok: boolean; error?: string }> }).submitFederatedEmailLogin;
+
+      if (!submitFn) {
         return {
           action: 'login_required',
-          reason: 'Driver does not support federated SSO email submission.'
+          reason: 'Driver does not support federated SSO identifier submission.'
         };
       }
 
       state.submittedEmail = true;
       state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
-      const submitRes = await driver.submitFederatedEmailLogin(email);
+      const submitRes = await submitFn.call(fedDriver, email);
       if (!submitRes.ok) {
         return {
           action: 'login_required',

@@ -3,7 +3,10 @@ import {
   type PolimiStageInspectionResult,
   type FederatedSsoInspectionResult
 } from '@polisdk/poliauth/domain';
-import type { AuthPageDriverPort } from '@polisdk/poliauth/interfaces';
+import type {
+  AuthPageDriverPort,
+  FederatedAuthPageDriverPort
+} from '@polisdk/poliauth/interfaces';
 import { ensureAuthAdaptersInjected, type EvaluatablePageLike } from './injected-auth-bundle.js';
 
 /**
@@ -41,7 +44,8 @@ export interface PlaywrightAuthPageDriverOptions {
  * Automatically injects `window.__PoliAuthAdapters` and guards against transient
  * `"Execution context was destroyed"` errors during multi-hop SAML/JAF redirects.
  */
-export class PlaywrightAuthPageDriver implements AuthPageDriverPort {
+export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
+  public readonly federatedProviderId: string = 'webex';
   private readonly page: PlaywrightPageLike;
   private readonly options: PlaywrightAuthPageDriverOptions;
 
@@ -140,8 +144,9 @@ export class PlaywrightAuthPageDriver implements AuthPageDriverPort {
       }, selector);
     } catch {
       return {
+        providerId: this.federatedProviderId,
         status: 'sso_in_transit',
-        isEmailSsoPage: false,
+        isIdentifierPrompt: false,
         isSamlTransitPage: true,
         url: this.page.url(),
         reason: 'Page navigating across SAML SSO redirect'
@@ -149,10 +154,14 @@ export class PlaywrightAuthPageDriver implements AuthPageDriverPort {
     }
   }
 
-  async submitFederatedEmailLogin(email: string): Promise<{ ok: boolean; error?: string }> {
+  async submitFederatedIdentifier(identifier: string): Promise<{ ok: boolean; error?: string }> {
     await ensureAuthAdaptersInjected(this.page);
-    return await this.page.evaluate((mail) => {
-      return window.__PoliAuthAdapters!.webexSso.submitWebexEmailLogin(document, mail);
-    }, email);
+    return await this.page.evaluate((id) => {
+      return window.__PoliAuthAdapters!.webexSso.submitWebexEmailLogin(document, id);
+    }, identifier);
+  }
+
+  async submitFederatedEmailLogin(email: string): Promise<{ ok: boolean; error?: string }> {
+    return this.submitFederatedIdentifier(email);
   }
 }

@@ -82,7 +82,7 @@ export const LOGIN_STATUS_LABELS: Record<LoginFlowStatus, string> = {
 };
 
 /**
- * Status of a federated SAML SSO flow.
+ * Status of a federated SAML SSO flow, as observed from the Service Provider (SP) side.
  */
 export type FederatedSsoStatus =
   | 'authenticated'
@@ -90,9 +90,21 @@ export type FederatedSsoStatus =
   | 'sso_in_transit'
   | 'error';
 
+/**
+ * Provider-neutral classification of the current page during a federated SAML SSO flow.
+ */
 export interface FederatedSsoInspectionResult {
+  /** Identifier of the federated SSO provider adapter that produced this result (e.g. `'webex'`). */
+  providerId: string;
   status: FederatedSsoStatus;
-  isEmailSsoPage: boolean;
+  /**
+   * `true` when the SP renders an identifier-discovery prompt (institutional email /
+   * username) that must be submitted before the SP redirects to the PoliMi IdP.
+   */
+  isIdentifierPrompt: boolean;
+  /** Optional alias for isIdentifierPrompt for backward compatibility. */
+  isEmailSsoPage?: boolean;
+  /** `true` while the browser is on SP/IdP SAML redirect or assertion endpoints. */
   isSamlTransitPage: boolean;
   url: string;
   reason?: string;

@@ -68,6 +68,7 @@ describe("ChromeLocalVaultStorage & ChromeExtensionTabDriver", () => {
         isSamlTransitPage: false,
         url: "https://web.webex.com/sign-in",
       }),
+      submitFederatedIdentifier: async () => ({ ok: true }),
       submitFederatedEmailLogin: async () => ({ ok: true }),
     } as unknown as DomAuthPageDriver;
 
@@ -116,5 +117,10 @@ describe("ChromeLocalVaultStorage & ChromeExtensionTabDriver", () => {
       "mario.rossi@mail.polimi.it",
     );
     expect(ssoSub.ok).toBe(true);
+
+    const idSub = await driver.submitFederatedIdentifier(
+      "mario.rossi@mail.polimi.it",
+    );
+    expect(idSub.ok).toBe(true);
   });
 });

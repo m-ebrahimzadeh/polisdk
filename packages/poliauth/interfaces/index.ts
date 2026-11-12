@@ -3,9 +3,12 @@
  * Public Interfaces & Ports for PoliAuth.
  */
 
-export * from './storage-port';
-export * from './crypto-port';
-export * from './browser-driver-port';
-export * from './otp-provider-port';
-export * from './authorization-port';
-export * from './logger-port';
+export * from './maybe-promise.js';
+export * from './storage-port.js';
+export * from './crypto-port.js';
+export * from './browser-driver-port.js';
+export * from './federated-sso-provider-port.js';
+export * from './session-pool-port.js';
+export * from './otp-provider-port.js';
+export * from './authorization-port.js';
+export * from './logger-port.js';

@@ -7,6 +7,7 @@
 import {
   DomAuthPageDriver,
   type AuthPageDriverPort,
+  type FederatedAuthPageDriverPort,
   type FederatedSsoInspectionResult,
   type PolimiStageInspectionResult,
 } from "@polisdk/poliauth";
@@ -34,7 +35,8 @@ export type PoliAuthTabMessage =
     }
   | { type: "POLIAUTH_SUBMIT_OTP"; otp: string }
   | { type: "POLIAUTH_INSPECT_FEDERATED_SSO" }
-  | { type: "POLIAUTH_SUBMIT_FEDERATED_EMAIL"; email: string };
+  | { type: "POLIAUTH_SUBMIT_FEDERATED_EMAIL"; email: string }
+  | { type: "POLIAUTH_SUBMIT_FEDERATED_IDENTIFIER"; identifier: string };
 
 function resolveDefaultChromeTabs(): ChromeTabsLike {
   const chromeObj = (globalThis as { chrome?: typeof chrome }).chrome;
@@ -47,17 +49,19 @@ function resolveDefaultChromeTabs(): ChromeTabsLike {
 }
 
 /**
- * `AuthPageDriverPort` implementation that communicates with a content script
+ * `FederatedAuthPageDriverPort` implementation that communicates with a content script
  * injected into a Chrome browser tab via `chrome.tabs.sendMessage`.
  */
-export class ChromeExtensionTabDriver implements AuthPageDriverPort {
+export class ChromeExtensionTabDriver implements FederatedAuthPageDriverPort {
+  readonly federatedProviderId: string;
   private readonly tabId: number;
   private readonly tabs: ChromeTabsLike;
   private lastKnownUrl = "";
 
-  constructor(tabId: number, tabs?: ChromeTabsLike) {
+  constructor(tabId: number, tabs?: ChromeTabsLike, federatedProviderId = "webex") {
     this.tabId = tabId;
     this.tabs = tabs ?? resolveDefaultChromeTabs();
+    this.federatedProviderId = federatedProviderId;
   }
 
   getCurrentUrl(): string {
@@ -134,16 +138,22 @@ export class ChromeExtensionTabDriver implements AuthPageDriverPort {
     });
   }
 
-  async submitFederatedEmailLogin(
-    email: string,
+  async submitFederatedIdentifier(
+    identifier: string,
   ): Promise<{ ok: boolean; error?: string }> {
     return this.tabs.sendMessage<
       PoliAuthTabMessage,
       { ok: boolean; error?: string }
     >(this.tabId, {
-      type: "POLIAUTH_SUBMIT_FEDERATED_EMAIL",
-      email,
+      type: "POLIAUTH_SUBMIT_FEDERATED_IDENTIFIER",
+      identifier,
     });
+  }
+
+  async submitFederatedEmailLogin(
+    email: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    return this.submitFederatedIdentifier(email);
   }
 }
 
@@ -170,8 +180,14 @@ export function createPoliAuthContentScriptHandler(
         return domDriver.submitOtp({ otp: message.otp });
       case "POLIAUTH_INSPECT_FEDERATED_SSO":
         return domDriver.inspectFederatedSsoPage();
+      case "POLIAUTH_SUBMIT_FEDERATED_IDENTIFIER":
+        return typeof domDriver.submitFederatedIdentifier === 'function'
+          ? domDriver.submitFederatedIdentifier(message.identifier)
+          : domDriver.submitFederatedEmailLogin(message.identifier);
       case "POLIAUTH_SUBMIT_FEDERATED_EMAIL":
-        return domDriver.submitFederatedEmailLogin(message.email);
+        return typeof domDriver.submitFederatedEmailLogin === 'function'
+          ? domDriver.submitFederatedEmailLogin(message.email)
+          : domDriver.submitFederatedIdentifier(message.email);
       default:
         return undefined;
     }

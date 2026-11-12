@@ -1,7 +1,11 @@
 /**
  * @module @polisdk/poliauth/domain/login-flow-spec
- * Specification of the Politecnico di Milano (aunicalogin -> Authenticated Session)
- * and Federated SAML 2.0 SSO login flows.
+ * Specification of the Politecnico di Milano Identity Provider login flow
+ * (`aunicalogin.polimi.it` -> authenticated `servizionline.polimi.it` session).
+ *
+ * This specification is strictly limited to PoliMi's own IdP. Federated SAML
+ * Service Provider specifications are owned by their provider adapters
+ * (see `adapters/webex-sso-dom-adapter.ts` -> `WEBEX_SAML_FLOW_SPEC`).
  */
 
 export const POLIMI_LOGIN_FLOW_SPEC = {
@@ -91,22 +95,17 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
   },
 
   /**
-   * Federated SAML SSO Email Discovery ("Sign In - Webex" on `idbroker-eu.webex.com`).
+   * Step 5: PoliMi acting as a SAML 2.0 Identity Provider (IdP).
+   *
+   * When a federated Service Provider (SP) delegates authentication to Politecnico
+   * di Milano, the browser transits through these IdP hostnames. Every federated SP
+   * adapter treats them as "SAML in transit" from the SP's point of view, while the
+   * orchestrator drives the actual IdP pages through `PolimiIdpPagePort`.
+   *
+   * Service-Provider-specific specifications (Webex, Zoom, GitLab, ...) deliberately
+   * do NOT live here: they are owned by their federated SSO provider adapters.
    */
-  webexSsoPage: {
-    hostnames: ['idbroker-eu.webex.com', 'idbroker.webex.com'],
-    pathnameSubstring: '/idb/saml2/jsp/doSSO.jsp',
-    visibleFormSelector: 'form#md-form',
-    hiddenLookupFormSelector: 'form#GlobalEmailLookupForm',
-    emailInputSelector: 'input#IDToken1[name="IDToken1"], input#IDToken1',
-    submitButtonSelector: 'button#IDButton2[name="btnOK"], button#IDButton2',
-    contextualErrorSelector: '#nameContextualError1',
-    samlTransitHostnames: [
-      'idbroker-eu.webex.com',
-      'idbroker.webex.com',
-      'shibidp.polimi.it',
-      'idp.polimi.it',
-      'aunicalogin.polimi.it'
-    ]
+  samlIdentityProvider: {
+    transitHostnames: ['aunicalogin.polimi.it', 'shibidp.polimi.it', 'idp.polimi.it']
   }
 } as const;

@@ -11,9 +11,14 @@ import {
 import {
   isWebexEmailSsoPage,
   inspectWebexSsoPage,
-  submitWebexEmailLogin
+  submitWebexEmailLogin,
+  WebexSamlProviderAdapter
 } from '../adapters/webex-sso-dom-adapter.js';
-import { DomAuthPageDriver } from '../adapters/dom-page-driver.js';
+import {
+  FederatedSsoProviderRegistry,
+  SelectorFederatedSsoProviderAdapter
+} from '../adapters/index.js';
+import { DomAuthPageDriver, DomFederatedAuthPageDriver } from '../adapters/dom-page-driver.js';
 
 describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
   it('detects and recovers from Stage 0 SessioneTerminata security violation page', () => {
@@ -192,7 +197,9 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     expect(isWebexEmailSsoPage(doc, loc)).toBe(true);
     const inspection = inspectWebexSsoPage(doc, loc);
     expect(inspection.status).toBe('login_required');
+    expect(inspection.isIdentifierPrompt).toBe(true);
     expect(inspection.isEmailSsoPage).toBe(true);
+    expect(inspection.providerId).toBe('webex');
 
     const eventsFired: string[] = [];
     const emailInput = doc.querySelector<HTMLInputElement>('#IDToken1')!;
@@ -216,5 +223,99 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     expect(eventsFired).toEqual(['input', 'change', 'blur']);
     expect(nextButton.disabled).toBe(false);
     expect(buttonClicked).toBe(true);
+  });
+
+  it('supports pluggable WebexSamlProviderAdapter implementing FederatedSsoProviderAdapterPort', async () => {
+    const dom = new JSDOM(
+      `<!DOCTYPE html>
+      <html>
+        <body>
+          <form id="md-form" action="/idb/saml2/jsp/doSSO.jsp" method="POST">
+            <input id="IDToken1" name="IDToken1" type="email" />
+            <button id="IDButton2" name="btnOK" type="button" disabled>Next</button>
+          </form>
+        </body>
+      </html>`,
+      { url: 'https://idbroker-eu.webex.com/idb/saml2/jsp/doSSO.jsp' }
+    );
+
+    const doc = dom.window.document;
+    const loc = dom.window.location;
+    const adapter = new WebexSamlProviderAdapter();
+    expect(adapter.providerId).toBe('webex');
+    expect(adapter.displayName).toBe('Webex');
+
+    const inspection = adapter.inspectPage(doc, loc);
+    expect(inspection.status).toBe('login_required');
+    expect(inspection.providerId).toBe('webex');
+    expect(inspection.isIdentifierPrompt).toBe(true);
+
+    let clicked = false;
+    doc.querySelector<HTMLButtonElement>('#IDButton2')?.addEventListener('click', () => {
+      clicked = true;
+    });
+
+    const submitRes = adapter.submitIdentifier(doc, 'student@mail.polimi.it');
+    expect(submitRes.ok).toBe(true);
+    expect(clicked).toBe(true);
+    expect((doc.querySelector('#IDToken1') as HTMLInputElement).value).toBe('student@mail.polimi.it');
+  });
+
+  it('proves Open/Closed Principle: plugs a custom Zoom SAML provider into DomFederatedAuthPageDriver without modifying core interfaces', async () => {
+    const customZoomSpec = {
+      providerId: 'zoom',
+      displayName: 'Zoom',
+      identifierPrompt: {
+        hostnames: ['polimi-it.zoom.us'],
+        pathnameSubstrings: ['/signin'],
+        identifierInputSelector: 'input#email',
+        submitButtonSelector: 'button#btn-continue',
+        forceEnableSubmitButton: false
+      },
+      transitHostnames: ['polimi-it.zoom.us'],
+      transitUrlSubstrings: ['/saml/sso'],
+      authenticatedHostnames: ['zoom.us'],
+      authenticatedSelectors: ['.zoom-profile-header']
+    } as const;
+
+    const zoomAdapter = new SelectorFederatedSsoProviderAdapter(customZoomSpec);
+    const registry = new FederatedSsoProviderRegistry([zoomAdapter]);
+    expect(registry.has('zoom')).toBe(true);
+    expect(registry.require('zoom').displayName).toBe('Zoom');
+
+    const dom = new JSDOM(
+      `<!DOCTYPE html>
+      <html>
+        <body>
+          <form id="zoom-form" action="/saml/sso">
+            <input id="email" type="email" />
+            <button id="btn-continue" type="button">Continue</button>
+          </form>
+        </body>
+      </html>`,
+      { url: 'https://polimi-it.zoom.us/signin' }
+    );
+
+    const driver = new DomFederatedAuthPageDriver({
+      getDocument: () => dom.window.document,
+      getLocation: () => dom.window.location,
+      provider: zoomAdapter
+    });
+
+    expect(driver.federatedProviderId).toBe('zoom');
+    const inspection = await driver.inspectFederatedSsoPage();
+    expect(inspection.providerId).toBe('zoom');
+    expect(inspection.status).toBe('login_required');
+    expect(inspection.isIdentifierPrompt).toBe(true);
+
+    let clicked = false;
+    dom.window.document.querySelector('#btn-continue')?.addEventListener('click', () => {
+      clicked = true;
+    });
+
+    const res = await driver.submitFederatedIdentifier('professor@polimi.it');
+    expect(res.ok).toBe(true);
+    expect(clicked).toBe(true);
+    expect((dom.window.document.querySelector('#email') as HTMLInputElement).value).toBe('professor@polimi.it');
   });
 });
