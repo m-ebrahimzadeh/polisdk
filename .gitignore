@@ -6,3 +6,4 @@ coverage/
 *.sqlite-wal
 .vault_master_key
 .env
+.vscode/
