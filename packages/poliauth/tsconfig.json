@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./dist",
+    "types": ["chrome", "node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "domain/**/*.ts",
+    "interfaces/**/*.ts",
+    "adapters/**/*.ts",
+    "middleware/**/*.ts",
+    "storage/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}

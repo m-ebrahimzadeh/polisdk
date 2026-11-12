@@ -1,0 +1,80 @@
+{
+  "name": "@polisdk/poliauth",
+  "version": "1.0.0",
+  "description": "Standalone authentication, 2FA TOTP, AES-256-GCM credential vault, federated SAML SSO, session management, user identity persistence, and authorization library for Politecnico di Milano applications.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./domain": {
+      "types": "./dist/domain/index.d.ts",
+      "import": "./dist/domain/index.js"
+    },
+    "./interfaces": {
+      "types": "./dist/interfaces/index.d.ts",
+      "import": "./dist/interfaces/index.js"
+    },
+    "./adapters": {
+      "types": "./dist/adapters/index.d.ts",
+      "import": "./dist/adapters/index.js"
+    },
+    "./middleware": {
+      "types": "./dist/middleware/index.d.ts",
+      "import": "./dist/middleware/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js"
+    },
+    "./browser-bundle": {
+      "import": "./dist/injected-auth-adapters.iife.js"
+    }
+  },
+  "files": [
+    "dist",
+    "domain",
+    "interfaces",
+    "adapters",
+    "middleware",
+    "storage",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "better-sqlite3": ">=9.0.0",
+    "playwright": ">=1.40.0"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
+    "playwright": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "polimi",
+    "polisdk",
+    "poliauth",
+    "authentication",
+    "sso",
+    "saml",
+    "totp",
+    "2fa",
+    "aes-256-gcm",
+    "vault",
+    "playwright",
+    "chrome-extension"
+  ],
+  "license": "MIT"
+}

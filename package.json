@@ -1,0 +1,27 @@
+{
+  "name": "polisdk-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PoliSDK — Modular TypeScript SDK & platform for Politecnico di Milano automation, authentication, and student services.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/chrome": "^0.0.287",
+    "@types/node": "^22.10.0",
+    "better-sqlite3": "^11.8.1",
+    "esbuild": "^0.24.2",
+    "jsdom": "^25.0.1",
+    "playwright": "1.50.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

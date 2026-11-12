@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.vault_master_key
+.env
