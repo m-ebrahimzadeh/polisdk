@@ -1,13 +1,13 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import type { SavedVaultCredentials, IdentityId } from '../domain/entities.js';
 import { mergeVaultCredentials } from '../domain/credentials.js';
 import type { EncryptedPayload, VaultMetadata } from '../interfaces/crypto-port.js';
 import type { VaultStoragePort, UserVaultStorageFactoryPort } from '../interfaces/storage-port.js';
 import type { AuthLoggerPort } from '../interfaces/logger-port.js';
 
-export const VAULT_STORAGE_KEY = 'polirecord_secure_vault_v1';
-export const VAULT_META_KEY = 'polirecord_vault_meta_v1';
-export const PLAYWRIGHT_STORAGE_STATE_KEY = 'polirecord_playwright_storage_state_v1';
+export const VAULT_STORAGE_KEY = 'poliauth_credentials_vault_v1';
+export const VAULT_META_KEY = 'poliauth_vault_meta_v1';
+export const SESSION_STATE_STORAGE_KEY = 'poliauth_session_state_v1';
+export const SESSION_STATE_META_KEY = 'poliauth_session_state_meta_v1';
 
 const PBKDF2_ITERATIONS = 100_000;
 const KEY_LENGTH_BITS = 256;
@@ -16,7 +16,7 @@ const IV_BYTES = 12;
 
 export interface VaultCryptoOptions {
   /**
-   * Optional custom master secret material for key derivation.
+   * Custom master secret material for PBKDF2 key derivation.
    */
   secretMaterial?: string;
   /**
@@ -25,15 +25,11 @@ export interface VaultCryptoOptions {
   logger?: AuthLoggerPort;
 }
 
-/**
- * Legacy Node `crypto` encrypted payload format used by `polirecord` for Playwright `storageState`.
- * Retained for 100% backward compatibility with existing `user_vault_kv` rows.
- */
-export interface LegacyNodeEncryptedPayload {
-  iv: string;
-  authTag: string;
-  ciphertext: string;
-  updatedAt: number;
+function getWebCrypto(): Crypto {
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+    return globalThis.crypto;
+  }
+  throw new Error('Web Crypto API (globalThis.crypto.subtle) is required by PoliAuth Vault.');
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -57,25 +53,24 @@ function normalizeKeyArray(keys: string | string[]): string[] {
   return Array.isArray(keys) ? keys : [keys];
 }
 
-function getExtensionKeyMaterial(overrideSecret?: string): string {
-  if (overrideSecret && overrideSecret.trim().length > 0) {
-    if (overrideSecret.startsWith('PoliRecord::VaultKey::v1::')) {
-      return overrideSecret;
-    }
-    return `PoliRecord::VaultKey::v1::${overrideSecret}::AES-256-GCM`;
-  }
-  const runtimeId =
-    typeof chrome !== 'undefined' && chrome?.runtime?.id
-      ? chrome.runtime.id
-      : 'polirecord-local-dev-vault-key';
-  return `PoliRecord::VaultKey::v1::${runtimeId}::AES-256-GCM`;
+function formatScopedKeyMaterial(domain: string, overrideSecret?: string): string {
+  const secret =
+    overrideSecret && overrideSecret.trim().length > 0
+      ? overrideSecret.trim()
+      : 'poliauth-default-local-secret-v1';
+  return `PoliAuth::${domain}::v1::${secret}::AES-256-GCM`;
 }
 
-async function deriveAesKey(salt: Uint8Array, secretOverride?: string): Promise<CryptoKey> {
+async function deriveAesKey(
+  salt: Uint8Array,
+  domain: string,
+  secretOverride?: string
+): Promise<CryptoKey> {
+  const webCrypto = getWebCrypto();
   const encoder = new TextEncoder();
-  const rawMaterial = encoder.encode(getExtensionKeyMaterial(secretOverride));
+  const rawMaterial = encoder.encode(formatScopedKeyMaterial(domain, secretOverride));
 
-  const baseKey = await crypto.subtle.importKey(
+  const baseKey = await webCrypto.subtle.importKey(
     'raw',
     rawMaterial as BufferSource,
     { name: 'PBKDF2' },
@@ -83,7 +78,7 @@ async function deriveAesKey(salt: Uint8Array, secretOverride?: string): Promise<
     ['deriveKey']
   );
 
-  return crypto.subtle.deriveKey(
+  return webCrypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
       salt: salt as BufferSource,
@@ -100,43 +95,31 @@ async function deriveAesKey(salt: Uint8Array, secretOverride?: string): Promise<
   );
 }
 
-async function getOrCreateSalt(storage: VaultStoragePort): Promise<Uint8Array> {
-  const data = await storage.get([VAULT_META_KEY]);
-  const existingMeta = data[VAULT_META_KEY] as VaultMetadata | undefined;
+async function getOrCreateSalt(
+  storage: VaultStoragePort,
+  metaKey: string
+): Promise<Uint8Array> {
+  const webCrypto = getWebCrypto();
+  const data = await storage.get([metaKey]);
+  const existingMeta = data[metaKey] as VaultMetadata | undefined;
   if (existingMeta?.salt && existingMeta.version === 1) {
     return base64ToBytes(existingMeta.salt);
   }
 
-  const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+  const salt = webCrypto.getRandomValues(new Uint8Array(SALT_BYTES));
   const meta: VaultMetadata = {
     salt: bytesToBase64(salt),
     version: 1
   };
-  await storage.set({ [VAULT_META_KEY]: meta });
+  await storage.set({ [metaKey]: meta });
   return salt;
 }
 
 /**
- * Resolves the default storage backend for current execution context:
- * - `chrome.storage.local` when running inside a Chromium extension
- * - `localStorage` fallback for web/JSDOM contexts
- * - ephemeral in-memory map fallback for headless/Node environments
+ * Resolves a default platform-agnostic storage backend (`localStorage` when available,
+ * otherwise an ephemeral in-memory map).
  */
 export function getDefaultStorageBackend(): VaultStoragePort {
-  if (typeof chrome !== 'undefined' && chrome?.storage?.local) {
-    return {
-      async get(keys: string | string[]) {
-        return await chrome.storage.local.get(normalizeKeyArray(keys));
-      },
-      async set(items: Record<string, unknown>) {
-        await chrome.storage.local.set(items);
-      },
-      async remove(keys: string | string[]) {
-        await chrome.storage.local.remove(normalizeKeyArray(keys));
-      }
-    };
-  }
-
   const memoryFallback = new Map<string, unknown>();
   return {
     async get(keys: string | string[]) {
@@ -178,26 +161,23 @@ export function getDefaultStorageBackend(): VaultStoragePort {
   };
 }
 
-/**
- * Encrypts and persists `SavedVaultCredentials` (merging with any already-stored fields)
- * using PBKDF2-HMAC-SHA256 (100,000 iterations) + AES-256-GCM.
- */
-export async function saveEncryptedCredentials(
-  creds: Partial<SavedVaultCredentials>,
-  storage: VaultStoragePort = getDefaultStorageBackend(),
-  options?: VaultCryptoOptions
-): Promise<SavedVaultCredentials> {
-  const existing = await loadEncryptedCredentials(storage, options);
-  const merged = mergeVaultCredentials(existing, creds, Date.now());
-
-  const effectiveSecret = options?.secretMaterial ?? storage.getSecretMaterial?.();
-  const salt = await getOrCreateSalt(storage);
-  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const key = await deriveAesKey(salt, effectiveSecret);
+async function encryptJsonValue(
+  value: unknown,
+  storage: VaultStoragePort,
+  payloadKey: string,
+  metaKey: string,
+  domain: string,
+  secretMaterial?: string
+): Promise<void> {
+  const webCrypto = getWebCrypto();
+  const effectiveSecret = secretMaterial ?? storage.getSecretMaterial?.();
+  const salt = await getOrCreateSalt(storage, metaKey);
+  const iv = webCrypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const key = await deriveAesKey(salt, domain, effectiveSecret);
 
   const encoder = new TextEncoder();
-  const plaintext = encoder.encode(JSON.stringify(merged));
-  const encryptedBuffer = await crypto.subtle.encrypt(
+  const plaintext = encoder.encode(JSON.stringify(value));
+  const encryptedBuffer = await webCrypto.subtle.encrypt(
     { name: 'AES-GCM', iv: iv as BufferSource },
     key,
     plaintext as BufferSource
@@ -207,27 +187,25 @@ export async function saveEncryptedCredentials(
     version: 1,
     iv: bytesToBase64(iv),
     ciphertext: bytesToBase64(new Uint8Array(encryptedBuffer)),
-    updatedAt: merged.updatedAt
+    updatedAt: Date.now()
   };
 
   await storage.set({
-    [VAULT_STORAGE_KEY]: payload
+    [payloadKey]: payload
   });
-
-  return merged;
 }
 
-/**
- * Loads and decrypts `SavedVaultCredentials` from a `VaultStoragePort`.
- * Returns `null` if no credentials are stored or if decryption fails (e.g., rotated key).
- */
-export async function loadEncryptedCredentials(
-  storage: VaultStoragePort = getDefaultStorageBackend(),
+async function decryptJsonValue<T>(
+  storage: VaultStoragePort,
+  payloadKey: string,
+  metaKey: string,
+  domain: string,
   options?: VaultCryptoOptions
-): Promise<SavedVaultCredentials | null> {
-  const data = await storage.get([VAULT_STORAGE_KEY, VAULT_META_KEY]);
-  const payload = data[VAULT_STORAGE_KEY] as EncryptedPayload | undefined;
-  const meta = data[VAULT_META_KEY] as VaultMetadata | undefined;
+): Promise<T | null> {
+  const webCrypto = getWebCrypto();
+  const data = await storage.get([payloadKey, metaKey]);
+  const payload = data[payloadKey] as EncryptedPayload | undefined;
+  const meta = data[metaKey] as VaultMetadata | undefined;
 
   if (!payload || payload.version !== 1 || !payload.iv || !payload.ciphertext || !meta?.salt) {
     return null;
@@ -238,20 +216,61 @@ export async function loadEncryptedCredentials(
     const salt = base64ToBytes(meta.salt);
     const iv = base64ToBytes(payload.iv);
     const ciphertext = base64ToBytes(payload.ciphertext);
-    const key = await deriveAesKey(salt, effectiveSecret);
+    const key = await deriveAesKey(salt, domain, effectiveSecret);
 
-    const decryptedBuffer = await crypto.subtle.decrypt(
+    const decryptedBuffer = await webCrypto.subtle.decrypt(
       { name: 'AES-GCM', iv: iv as BufferSource },
       key,
       ciphertext as BufferSource
     );
 
     const decoder = new TextDecoder();
-    return JSON.parse(decoder.decode(decryptedBuffer)) as SavedVaultCredentials;
+    return JSON.parse(decoder.decode(decryptedBuffer)) as T;
   } catch (err) {
-    options?.logger?.warn('Failed to decrypt saved credentials vault', err);
+    options?.logger?.warn(`Failed to decrypt vault payload (${payloadKey})`, err);
     return null;
   }
+}
+
+/**
+ * Encrypts and persists `SavedVaultCredentials` (merging with any already-stored fields)
+ * using Web Crypto PBKDF2-HMAC-SHA256 (100,000 iterations) + AES-256-GCM.
+ */
+export async function saveEncryptedCredentials(
+  creds: Partial<SavedVaultCredentials>,
+  storage: VaultStoragePort = getDefaultStorageBackend(),
+  options?: VaultCryptoOptions
+): Promise<SavedVaultCredentials> {
+  const existing = await loadEncryptedCredentials(storage, options);
+  const merged = mergeVaultCredentials(existing, creds, Date.now());
+
+  await encryptJsonValue(
+    merged,
+    storage,
+    VAULT_STORAGE_KEY,
+    VAULT_META_KEY,
+    'VaultKey',
+    options?.secretMaterial
+  );
+
+  return merged;
+}
+
+/**
+ * Loads and decrypts `SavedVaultCredentials` from a `VaultStoragePort`.
+ * Returns `null` if no credentials are stored or if decryption fails.
+ */
+export async function loadEncryptedCredentials(
+  storage: VaultStoragePort = getDefaultStorageBackend(),
+  options?: VaultCryptoOptions
+): Promise<SavedVaultCredentials | null> {
+  return decryptJsonValue<SavedVaultCredentials>(
+    storage,
+    VAULT_STORAGE_KEY,
+    VAULT_META_KEY,
+    'VaultKey',
+    options
+  );
 }
 
 /**
@@ -264,81 +283,45 @@ export async function clearEncryptedCredentials(
 }
 
 /**
- * Encrypts and stores serialized browser session state (e.g., Playwright `storageState`)
- * using AES-256-GCM derived from `secretMaterial`.
+ * Encrypts and stores serialized session state using Web Crypto PBKDF2-HMAC-SHA256 + AES-256-GCM.
  */
 export async function saveEncryptedSessionState(
   storage: VaultStoragePort,
-  storageState: unknown,
+  sessionState: unknown,
   secretMaterial?: string
 ): Promise<void> {
-  const effectiveSecret =
-    secretMaterial ?? storage.getSecretMaterial?.() ?? getExtensionKeyMaterial();
-  const key = createHash('sha256').update(`PoliRecord::StorageState::${effectiveSecret}`).digest();
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const plaintext = Buffer.from(JSON.stringify(storageState), 'utf8');
-  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-
-  const payload: LegacyNodeEncryptedPayload = {
-    iv: iv.toString('base64'),
-    authTag: authTag.toString('base64'),
-    ciphertext: encrypted.toString('base64'),
-    updatedAt: Date.now()
-  };
-
-  await storage.set({
-    [PLAYWRIGHT_STORAGE_STATE_KEY]: payload
-  });
+  await encryptJsonValue(
+    sessionState,
+    storage,
+    SESSION_STATE_STORAGE_KEY,
+    SESSION_STATE_META_KEY,
+    'SessionStateKey',
+    secretMaterial
+  );
 }
 
 /**
- * Loads and decrypts serialized browser session state (e.g., Playwright `storageState`).
+ * Loads and decrypts serialized session state using Web Crypto PBKDF2-HMAC-SHA256 + AES-256-GCM.
  */
 export async function loadEncryptedSessionState<T = unknown>(
   storage: VaultStoragePort,
-  secretMaterial?: string
+  secretMaterial?: string,
+  logger?: AuthLoggerPort
 ): Promise<T | null> {
-  const data = await storage.get([PLAYWRIGHT_STORAGE_STATE_KEY]);
-  const raw = data[PLAYWRIGHT_STORAGE_STATE_KEY] as
-    | LegacyNodeEncryptedPayload
-    | EncryptedPayload
-    | undefined;
-
-  if (!raw) {
-    return null;
-  }
-
-  const effectiveSecret =
-    secretMaterial ?? storage.getSecretMaterial?.() ?? getExtensionKeyMaterial();
-
-  try {
-    if ('authTag' in raw && raw.iv && raw.authTag && raw.ciphertext) {
-      const key = createHash('sha256')
-        .update(`PoliRecord::StorageState::${effectiveSecret}`)
-        .digest();
-      const iv = Buffer.from(raw.iv, 'base64');
-      const authTag = Buffer.from(raw.authTag, 'base64');
-      const ciphertext = Buffer.from(raw.ciphertext, 'base64');
-
-      const decipher = createDecipheriv('aes-256-gcm', key, iv);
-      decipher.setAuthTag(authTag);
-      const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-      return JSON.parse(decrypted.toString('utf8')) as T;
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
+  return decryptJsonValue<T>(
+    storage,
+    SESSION_STATE_STORAGE_KEY,
+    SESSION_STATE_META_KEY,
+    'SessionStateKey',
+    { secretMaterial, logger }
+  );
 }
 
 /**
- * Removes encrypted browser session state from the given storage backend.
+ * Removes encrypted session state and metadata from the given storage backend.
  */
 export async function clearEncryptedSessionState(storage: VaultStoragePort): Promise<void> {
-  await storage.remove([PLAYWRIGHT_STORAGE_STATE_KEY]);
+  await storage.remove([SESSION_STATE_STORAGE_KEY, SESSION_STATE_META_KEY]);
 }
 
 /**
@@ -417,7 +400,11 @@ export class EncryptedCredentialVault {
     secretOverride?: string
   ): Promise<T | null> {
     const { storage, cryptoOptions } = this.resolveStorage(identityId, secretOverride);
-    return loadEncryptedSessionState<T>(storage, cryptoOptions?.secretMaterial);
+    return loadEncryptedSessionState<T>(
+      storage,
+      cryptoOptions?.secretMaterial,
+      cryptoOptions?.logger
+    );
   }
 
   async clearSessionState(identityId?: IdentityId, secretOverride?: string): Promise<void> {

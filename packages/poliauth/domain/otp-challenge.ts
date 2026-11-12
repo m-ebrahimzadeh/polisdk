@@ -6,19 +6,30 @@
  * manual 6-digit OTP waiters per user with bounded timeouts.
  */
 
-import { normalizeIdentityId, type IdentityId } from './entities';
-import { TotpService } from './totp';
-import type { TotpGeneratorPort } from '../interfaces/crypto-port';
+import { normalizeIdentityId, type IdentityId } from './entities.js';
+import { TotpService } from './totp.js';
+import type { TotpGeneratorPort } from '../interfaces/crypto-port.js';
 import type {
   LoginProgressCallbacks,
   OtpChallengeProviderPort,
   OtpResolutionResult
-} from '../interfaces/otp-provider-port';
+} from '../interfaces/otp-provider-port.js';
 
 interface PendingOtpWaiter {
   resolve: (otp: string) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+function unrefTimerIfSupported(timer: unknown): void {
+  if (
+    typeof timer === 'object' &&
+    timer !== null &&
+    'unref' in timer &&
+    typeof (timer as { unref?: unknown }).unref === 'function'
+  ) {
+    (timer as { unref: () => void }).unref();
+  }
 }
 
 export interface OtpChallengeCoordinatorOptions {
@@ -134,14 +145,12 @@ export class OtpChallengeCoordinator implements OtpChallengeProviderPort {
         this.pendingWaiters.delete(key);
         reject(
           new Error(
-            'Timed out waiting for 6-digit 2FA OTP (2 minutes). Run /login to try again.'
+            'Timed out waiting for 6-digit 2FA OTP.'
           )
         );
       }, timeoutMs);
 
-      if (typeof (timer as NodeJS.Timeout).unref === 'function') {
-        (timer as NodeJS.Timeout).unref();
-      }
+      unrefTimerIfSupported(timer);
 
       this.pendingWaiters.set(key, { resolve, reject, timer });
     });

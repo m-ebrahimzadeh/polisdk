@@ -6,8 +6,7 @@
 export interface EncryptedPayload {
   version: number;
   iv: string; // Base64 (12-byte IV)
-  ciphertext: string; // Base64 (includes 16-byte GCM authTag in WebCrypto or separate authTag)
-  authTag?: string; // Optional separate Base64 GCM authTag for Node crypto compatibility
+  ciphertext: string; // Base64 (Web Crypto AES-GCM ciphertext + 128-bit auth tag)
   updatedAt: number;
 }
 

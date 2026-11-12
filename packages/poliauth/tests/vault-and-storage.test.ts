@@ -1,6 +1,3 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   maskPersonCode,
@@ -14,8 +11,13 @@ import {
   saveEncryptedCredentials,
   loadEncryptedCredentials,
   clearEncryptedCredentials,
+  saveEncryptedSessionState,
+  loadEncryptedSessionState,
+  clearEncryptedSessionState,
   VAULT_STORAGE_KEY,
   VAULT_META_KEY,
+  SESSION_STATE_STORAGE_KEY,
+  SESSION_STATE_META_KEY,
   EncryptedCredentialVault
 } from '../storage/vault.js';
 import {
@@ -24,19 +26,8 @@ import {
   InMemorySessionStateStore,
   InMemoryUserIdentityRepository
 } from '../storage/memory-storage.js';
-import { ChromeLocalVaultStorage } from '../storage/chrome-storage.js';
-import { resolveMasterEncryptionKey } from '../storage/master-key.js';
-import {
-  PoliAuthSqliteDatabase,
-  saveUserVaultCredentials,
-  loadUserVaultCredentials,
-  clearUserVaultCredentials,
-  saveUserBrowserStorageState,
-  loadUserBrowserStorageState,
-  SqliteSessionStateStore
-} from '../storage/sqlite-storage.js';
 
-describe('Credentials Domain & Encrypted Storage Adapters', () => {
+describe('Credentials Domain & Pure Web Crypto Storage Adapters', () => {
   it('masks person codes, emails, and secrets safely for display', () => {
     expect(maskPersonCode('10987654')).toBe('109***54');
     expect(maskPolimiEmail('mario.rossi@mail.polimi.it')).toBe('ma***i@mail.polimi.it');
@@ -55,8 +46,8 @@ describe('Credentials Domain & Encrypted Storage Adapters', () => {
     expect(isValidOtpCode('12345')).toBe(false);
   });
 
-  it('encrypts, merges, loads, and clears credentials in InMemoryVaultStorage', async () => {
-    const storage = new InMemoryVaultStorage();
+  it('encrypts, merges, loads, and clears credentials in InMemoryVaultStorage using Web Crypto', async () => {
+    const storage = new InMemoryVaultStorage('unit-test-secret');
     await saveEncryptedCredentials(
       {
         personCode: '10987654',
@@ -86,99 +77,65 @@ describe('Credentials Domain & Encrypted Storage Adapters', () => {
     expect(loaded?.totpSecret).toBe('JBSWY3DPEHPK3PXP');
     expect(loaded?.polimiEmail).toBe('mario.rossi@mail.polimi.it');
 
+    // Wrong key returns null cleanly
+    const wrongKeyResult = await loadEncryptedCredentials(storage, {
+      secretMaterial: 'wrong-secret-key'
+    });
+    expect(wrongKeyResult).toBeNull();
+
     await clearEncryptedCredentials(storage);
     expect(await loadEncryptedCredentials(storage)).toBeNull();
   });
 
-  it('supports ChromeLocalVaultStorage with an injected ChromeStorageAreaLike', async () => {
-    const backing = new InMemoryVaultStorage();
-    const chromeStorage = new ChromeLocalVaultStorage(backing);
-    const vault = new EncryptedCredentialVault({ storage: chromeStorage });
+  it('encrypts, loads, and clears session state using pure Web Crypto PBKDF2 + AES-256-GCM', async () => {
+    const storage = new InMemoryVaultStorage('session-secret-key');
+    const mockSessionState = {
+      cookies: [{ name: 'JSESSIONID', value: 'secret-cookie-value-999', domain: '.polimi.it' }],
+      origins: []
+    };
 
-    await vault.saveCredentials({
-      personCode: '10112233',
-      password: 'ChromePassword!'
-    });
+    await saveEncryptedSessionState(storage, mockSessionState);
+    const raw = await storage.get([SESSION_STATE_STORAGE_KEY, SESSION_STATE_META_KEY]);
+    expect(JSON.stringify(raw)).not.toContain('secret-cookie-value-999');
 
-    const loaded = await vault.loadCredentials();
-    expect(loaded?.personCode).toBe('10112233');
-    expect(loaded?.password).toBe('ChromePassword!');
+    const loaded = await loadEncryptedSessionState<typeof mockSessionState>(storage);
+    expect(loaded).toEqual(mockSessionState);
+
+    // Wrong secret returns null cleanly
+    expect(await loadEncryptedSessionState(storage, 'wrong-secret')).toBeNull();
+
+    await clearEncryptedSessionState(storage);
+    expect(await loadEncryptedSessionState(storage)).toBeNull();
   });
 
-  it('persists per-user encrypted credentials and Playwright storageState in SQLite with strict user and key isolation', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'poliauth-sqlite-test-'));
-    const dbPath = path.join(tmpDir, 'auth.sqlite');
-    const masterKey = resolveMasterEncryptionKey(undefined, tmpDir);
-    expect(masterKey.length).toBeGreaterThanOrEqual(32);
+  it('isolates multi-tenant credentials and session states via EncryptedCredentialVault & InMemoryUserVaultStorageFactory', async () => {
+    const factory = new InMemoryUserVaultStorageFactory('tenant-master-secret');
+    const vault = new EncryptedCredentialVault({ userFactory: factory });
 
-    const db = new PoliAuthSqliteDatabase(dbPath);
-    try {
-      const user1 = db.ensureUser(1001, { username: 'alice', displayName: 'Alice' });
-      const user2 = db.ensureUser(2002, { username: 'bob', displayName: 'Bob' });
-      expect(user1.username).toBe('alice');
-      expect(user2.username).toBe('bob');
-
-      await saveUserVaultCredentials(db, 1001, masterKey, {
+    await vault.saveCredentials(
+      {
         personCode: '10111111',
-        password: 'AliceSecretPassword!',
-        totpSecret: 'JBSWY3DPEHPK3PXP',
-        polimiEmail: 'alice@mail.polimi.it'
-      });
-
-      await saveUserVaultCredentials(db, 2002, masterKey, {
+        password: 'AliceSecretPassword!'
+      },
+      'alice'
+    );
+    await vault.saveCredentials(
+      {
         personCode: '10222222',
-        password: 'BobSecretPassword!',
-        polimiEmail: 'bob@mail.polimi.it'
-      });
+        password: 'BobSecretPassword!'
+      },
+      'bob'
+    );
 
-      const aliceCreds = await loadUserVaultCredentials(db, 1001, masterKey);
-      const bobCreds = await loadUserVaultCredentials(db, 2002, masterKey);
+    expect((await vault.loadCredentials('alice'))?.personCode).toBe('10111111');
+    expect((await vault.loadCredentials('bob'))?.personCode).toBe('10222222');
 
-      expect(aliceCreds?.personCode).toBe('10111111');
-      expect(aliceCreds?.password).toBe('AliceSecretPassword!');
-      expect(bobCreds?.personCode).toBe('10222222');
-      expect(bobCreds?.password).toBe('BobSecretPassword!');
-
-      // Wrong master key must return null cleanly without throwing
-      const wrongKeyAttempt = await loadUserVaultCredentials(
-        db,
-        1001,
-        'wrong-master-encryption-key-with-32-chars-minimum'
-      );
-      expect(wrongKeyAttempt).toBeNull();
-
-      // Encrypted Playwright storageState round-trip
-      const mockStorageState = {
-        cookies: [{ name: 'JSESSIONID', value: 'secret-cookie-123', domain: '.polimi.it' }],
-        origins: []
-      };
-      await saveUserBrowserStorageState(db, 1001, masterKey, mockStorageState);
-
-      const rawStateJson = db.getVaultKey(1001, 'polirecord_playwright_storage_state_v1');
-      expect(rawStateJson).toBeDefined();
-      expect(rawStateJson).not.toContain('secret-cookie-123');
-
-      const restoredState = await loadUserBrowserStorageState<typeof mockStorageState>(
-        db,
-        1001,
-        masterKey
-      );
-      expect(restoredState).toEqual(mockStorageState);
-
-      // SqliteSessionStateStore wrapper test
-      const sessionStore = new SqliteSessionStateStore(db, masterKey);
-      expect(await sessionStore.loadSessionState(1001)).toEqual(mockStorageState);
-
-      await clearUserVaultCredentials(db, 1001);
-      expect(await loadUserVaultCredentials(db, 1001, masterKey)).toBeNull();
-      expect(await loadUserBrowserStorageState(db, 1001, masterKey)).toBeNull();
-    } finally {
-      db.close();
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
+    await vault.saveSessionState({ ssoToken: 'alice-token' }, 'alice');
+    expect(await vault.loadSessionState('alice')).toEqual({ ssoToken: 'alice-token' });
+    expect(await vault.loadSessionState('bob')).toBeNull();
   });
 
-  it('supports InMemoryUserVaultStorageFactory, InMemorySessionStateStore, and InMemoryUserIdentityRepository', async () => {
+  it('supports InMemorySessionStateStore and InMemoryUserIdentityRepository', async () => {
     const userRepo = new InMemoryUserIdentityRepository();
     const u = userRepo.ensureUser('user-abc', { username: 'charlie', displayName: 'Charlie' });
     expect(u.loginStatus).toBe('idle');

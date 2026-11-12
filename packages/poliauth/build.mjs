@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
-import * as esbuild from 'esbuild';
 
 const pkgDir = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(pkgDir, 'dist');
@@ -26,15 +25,5 @@ fs.writeFileSync(
   `export * from './src/index.js';\n`,
   'utf8'
 );
-
-// 3. Pre-bundle the browser-injected DOM adapter IIFE script
-await esbuild.build({
-  entryPoints: [path.join(pkgDir, 'adapters/injected-auth-entry.ts')],
-  bundle: true,
-  outfile: path.join(distDir, 'injected-auth-adapters.iife.js'),
-  format: 'iife',
-  platform: 'browser',
-  target: ['es2022']
-});
 
 console.log('✅ @polisdk/poliauth built successfully into dist/');

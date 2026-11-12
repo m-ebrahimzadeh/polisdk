@@ -1,55 +1,47 @@
 /**
  * @module @polisdk/poliauth/domain/login-orchestrator
- * Unified, Driver-Agnostic Politecnico di Milano & Federated SAML SSO Orchestrator.
+ * Unified, Driver-Agnostic Politecnico di Milano SSO & Federated SAML SSO Orchestrator.
  *
- * Consolidates the multi-stage login state machines that were previously duplicated across:
- * - `polirecord/src/background/index.ts` (`executeAutomatedPolimiLogin` & Webex SSO poll loop)
- * - `polirecord/src/bot/browser/polimi-session.ts` (`ensureAuthenticatedArchivePage`)
- * - `polirecord/src/bot/browser/webex-downloader.ts` (Webex SAML SSO & mid-SAML credentials/OTP loop)
+ * Authentication concludes once an authenticated PoliMi session is established,
+ * completely decoupled from downstream service navigation.
  */
 
 import type {
   IdentityId,
   LoginCredentials,
   LoginFlowStatus
-} from './entities';
-import { POLIMI_LOGIN_FLOW_SPEC } from './login-flow-spec';
-import {
-  RECORDINGS_ARCHIVE_SERVICE,
-  type PolimiPortalServiceDescriptor
-} from './service-registry';
-import type { AuthPageDriverPort } from '../interfaces/browser-driver-port';
+} from './entities.js';
+import { POLIMI_LOGIN_FLOW_SPEC } from './login-flow-spec.js';
+import type { AuthPageDriverPort } from '../interfaces/browser-driver-port.js';
 import type {
   LoginProgressCallbacks,
   OtpChallengeProviderPort
-} from '../interfaces/otp-provider-port';
+} from '../interfaces/otp-provider-port.js';
 
 function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export interface PolimiServiceAuthRequest {
+export interface PolimiSessionAuthRequest {
   userId: IdentityId;
   driver: AuthPageDriverPort;
   credentials: Pick<LoginCredentials, 'personCode' | 'password'> &
     Partial<Pick<LoginCredentials, 'otp' | 'totpSecret' | 'polimiEmail'>>;
   /**
-   * Target portal service to open once authenticated on `Portale.do`.
-   * Defaults to `RECORDINGS_ARCHIVE_SERVICE` (`idServizio=2314`).
-   * Pass `null` if you only want to authenticate as far as `Portale.do`.
+   * Optional custom SSO entry URL. Defaults to `POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl`.
    */
-  targetService?: PolimiPortalServiceDescriptor | null;
+  entryUrl?: string;
   /** Maximum state-machine iterations before timing out. Default: 40. */
   maxSteps?: number;
   /** Poll delay in milliseconds between intermediate steps. Default: 400. */
   pollDelayMs?: number;
-  /** Optional callbacks for live UI/Telegram status updates. */
+  /** Optional callbacks for live status updates. */
   callbacks?: LoginProgressCallbacks;
-  /** Optional hook invoked whenever an authenticated target page is reached (e.g. to persist cookies). */
+  /** Optional hook invoked once an authenticated PoliMi session is established. */
   onAuthenticated?: () => void | Promise<void>;
 }
 
-export interface PolimiServiceAuthOutcome {
+export interface PolimiSessionAuthOutcome {
   ok: boolean;
   status: LoginFlowStatus;
   url?: string;
@@ -64,7 +56,7 @@ export interface FederatedSamlAuthRequest {
   pollIntervalMs?: number;
   /** Maximum poll iterations. Default: 180. */
   maxPollSteps?: number;
-  /** SAML transit window duration in ms after submitting email on `doSSO.jsp`. Default: 25_000. */
+  /** SAML transit window duration in ms after submitting email on federated SP. Default: 25_000. */
   ssoTransitWindowMs?: number;
   callbacks?: LoginProgressCallbacks;
   onAuthenticated?: () => void | Promise<void>;
@@ -80,17 +72,17 @@ export class PoliAuthOrchestrator {
   constructor(private readonly otpCoordinator: OtpChallengeProviderPort) {}
 
   /**
-   * Executes the full Politecnico di Milano SSO + 2FA + Online Services Portal
-   * + Target Service handoff state machine against any `AuthPageDriverPort`.
+   * Executes the Politecnico di Milano SSO + 2FA authentication state machine
+   * until an authenticated PoliMi session (`stage === 'authenticated'`) is established.
    */
-  public async authenticateToService(
-    req: PolimiServiceAuthRequest
-  ): Promise<PolimiServiceAuthOutcome> {
+  public async authenticate(
+    req: PolimiSessionAuthRequest
+  ): Promise<PolimiSessionAuthOutcome> {
     const {
       userId,
       driver,
       credentials,
-      targetService = RECORDINGS_ARCHIVE_SERVICE,
+      entryUrl = POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl,
       maxSteps = 40,
       pollDelayMs = 400,
       callbacks,
@@ -102,21 +94,14 @@ export class PoliAuthOrchestrator {
     };
 
     try {
-      // Check if already on the target service page
+      // Check if already in an authenticated PoliMi session
       const initialStage = await driver
-        .inspectPolimiStage(targetService ?? undefined)
+        .inspectPolimiStage()
         .catch(() => ({ stage: 'unknown' as const, url: '', title: '' }));
 
-      if (
-        initialStage.stage === 'archive' ||
-        initialStage.stage === 'target_service' ||
-        (targetService === null && initialStage.stage === 'portal')
-      ) {
+      if (initialStage.stage === 'authenticated') {
         await onAuthenticated?.();
-        await notify(
-          'authenticated',
-          `Authenticated on ${targetService?.name || 'PoliMi Online Services Portal'}.`
-        );
+        await notify('authenticated', 'Authenticated on PoliMi SSO session.');
         return {
           ok: true,
           status: 'authenticated',
@@ -125,35 +110,25 @@ export class PoliAuthOrchestrator {
       }
 
       await notify('opening_login', 'Opening PoliMi SSO login...');
-      await driver.goto(POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl);
+      await driver.goto(entryUrl);
 
       let submittedCredentialsCount = 0;
       let submittedAutoTotpCount = 0;
       let submittedManualOtpCount = 0;
-      let clickedPortalServiceCount = 0;
       let explicitOtpToConsume = credentials.otp?.trim() || '';
 
       for (let step = 0; step < maxSteps; step++) {
-        const stageInfo = await driver
-          .inspectPolimiStage(targetService ?? undefined)
-          .catch(() => null);
+        const stageInfo = await driver.inspectPolimiStage().catch(() => null);
 
         if (!stageInfo) {
           await sleep(pollDelayMs);
           continue;
         }
 
-        // 1. Target service reached
-        if (
-          stageInfo.stage === 'archive' ||
-          stageInfo.stage === 'target_service' ||
-          (targetService === null && stageInfo.stage === 'portal')
-        ) {
+        // 1. Authenticated PoliMi session reached
+        if (stageInfo.stage === 'authenticated') {
           await onAuthenticated?.();
-          await notify(
-            'authenticated',
-            `Authenticated on ${targetService?.name || 'PoliMi Online Services Portal'}.`
-          );
+          await notify('authenticated', 'Authenticated on PoliMi SSO session.');
           return {
             ok: true,
             status: 'authenticated',
@@ -163,6 +138,7 @@ export class PoliAuthOrchestrator {
 
         // 2. Session expired or bare /aunicalogin/ security violation recovery
         if (stageInfo.stage === 'session_expired') {
+          await notify('recovering_session', 'Recovering expired PoliMi session...');
           await driver.recoverSessionPage();
           await sleep(pollDelayMs);
           continue;
@@ -256,44 +232,12 @@ export class PoliAuthOrchestrator {
           continue;
         }
 
-        // 5. Online Services Portal (`Portale.do`) -> Click target service
-        if (stageInfo.stage === 'portal' && targetService !== null) {
-          if (clickedPortalServiceCount >= 3) {
-            const errMsg = `Failed to open ${targetService.name} from PoliMi Online Services Portal after multiple attempts.`;
-            await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
-          }
-          clickedPortalServiceCount += 1;
-
-          const statusKind: LoginFlowStatus =
-            targetService.serviceId ===
-            POLIMI_LOGIN_FLOW_SPEC.entry.recordingsArchiveServiceId
-              ? 'opening_recording_archives'
-              : 'opening_target_service';
-
-          await notify(
-            statusKind,
-            `Opening ${targetService.name} (idServizio=${targetService.serviceId})...`
-          );
-
-          const portalResult = await driver.openPortalService(targetService);
-          if (!portalResult.ok) {
-            const errMsg =
-              portalResult.error ||
-              `Could not find ${targetService.name} link on PoliMi Portal.`;
-            await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
-          }
-
-          if (pollDelayMs > 0) await sleep(Math.min(500, pollDelayMs));
-          continue;
-        }
-
-        // 6. Intermediate SSO handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`) or loading
+        // 5. Intermediate SSO handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`) or loading
         await sleep(pollDelayMs);
       }
 
-      const timeoutMsg = `Timed out navigating through PoliMi authentication pipeline to ${targetService?.name || 'Portal'}.`;
+      const timeoutMsg =
+        'Timed out navigating through PoliMi authentication pipeline.';
       await notify('failed', timeoutMsg);
       return { ok: false, status: 'failed', error: timeoutMsg };
     } catch (err) {
@@ -304,8 +248,7 @@ export class PoliAuthOrchestrator {
   }
 
   /**
-   * Handles a single step or full resolution of Federated SAML SSO (e.g. Webex `doSSO.jsp`
-   * -> `shibidp.polimi.it` -> `aunicalogin.polimi.it` -> target SP).
+   * Handles a single step of Federated SAML SSO across an SP and PoliMi IdP.
    */
   public async handleFederatedSamlStep(params: {
     userId: IdentityId;
@@ -341,9 +284,8 @@ export class PoliAuthOrchestrator {
       return { action: 'continue_polling' };
     }
 
-    // 2. PoliMi credentials form encountered during SAML SSO (`id_servizio=2070`)
+    // 2. PoliMi credentials form encountered during SAML SSO
     if (polimiStage && polimiStage.stage === 'credentials') {
-      // Give auto-SSO onload script 1 poll cycle to submit evn_checkCookieSSO if present
       if (!state.seenSamlCredentialsStep) {
         state.seenSamlCredentialsStep = true;
         return { action: 'continue_polling' };
@@ -394,7 +336,14 @@ export class PoliAuthOrchestrator {
       return { action: 'continue_polling' };
     }
 
-    // 4. Check Federated SSO state (e.g. Webex `doSSO.jsp` `#IDToken1` / `#IDButton2`)
+    // 4. Check Federated SSO state
+    if (!driver.inspectFederatedSsoPage) {
+      return {
+        action: 'login_required',
+        reason: 'Driver does not support federated SSO page inspection.'
+      };
+    }
+
     const ssoInspection = await driver.inspectFederatedSsoPage().catch(() => null);
     if (!ssoInspection) {
       return { action: 'continue_polling' };
@@ -411,6 +360,13 @@ export class PoliAuthOrchestrator {
           action: 'login_required',
           reason:
             'Federated SAML SSO requires your PoliMi email (@mail.polimi.it).'
+        };
+      }
+
+      if (!driver.submitFederatedEmailLogin) {
+        return {
+          action: 'login_required',
+          reason: 'Driver does not support federated SSO email submission.'
         };
       }
 

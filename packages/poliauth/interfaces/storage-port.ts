@@ -8,11 +8,10 @@ import type {
   LoginFlowStatus,
   UserIdentity,
   UserIdentityPatch
-} from '../domain/entities';
+} from '../domain/entities.js';
 
 /**
  * Low-level key-value storage port used by the AES-256-GCM Encrypted Vault.
- * Backward-compatible with `StorageBackend` in PoliRecord (`src/shared/vault.ts`).
  */
 export interface VaultStoragePort {
   get(keys: string | string[]): Promise<Record<string, unknown>>;
@@ -26,11 +25,6 @@ export interface VaultStoragePort {
 }
 
 /**
- * Backward-compatible alias for `VaultStoragePort`.
- */
-export type StorageBackend = VaultStoragePort;
-
-/**
  * Factory port that creates a user-scoped `VaultStoragePort`.
  */
 export interface UserVaultStorageFactoryPort {
@@ -39,7 +33,7 @@ export interface UserVaultStorageFactoryPort {
 
 /**
  * Port for persisting and restoring encrypted browser session state
- * (such as Playwright `storageState` cookies and localStorage origins).
+ * (such as serialized cookies and localStorage origins).
  */
 export interface SessionStateStorePort<TState = unknown> {
   saveSessionState(userId: IdentityId, state: TState): Promise<void>;
@@ -49,7 +43,6 @@ export interface SessionStateStorePort<TState = unknown> {
 
 /**
  * Repository port for managing user identities and authentication state.
- * Cleanly decoupled from application-specific tables (queues, caches, etc.).
  */
 export interface UserIdentityRepositoryPort {
   ensureUser(

@@ -3,7 +3,7 @@
  * Access Control and Resource Authorization Ports.
  */
 
-import type { AuthSubject, IdentityId } from '../domain/entities';
+import type { AuthSubject, IdentityId } from '../domain/entities.js';
 
 export type DenialReasonCode =
   | 'NON_PRIVATE_CHANNEL'
@@ -27,8 +27,7 @@ export interface ResourceDescriptor {
 }
 
 /**
- * Pluggable policy port for evaluating resource-level ownership or access rights
- * (e.g., verifying whether a user has access to a course or recording transferId).
+ * Pluggable policy port for evaluating resource-level ownership or access rights.
  */
 export interface ResourceAuthorizationPolicyPort {
   isResourceAuthorized(

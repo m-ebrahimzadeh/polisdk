@@ -1,38 +1,32 @@
 /**
  * @module @polisdk/poliauth/domain/login-flow-spec
- * Persistent specification of the Politecnico di Milano (aunicalogin -> Portale Servizi ->
- * Target Service -> Federated Webex SAML SSO) automated login flow captured from live debugging.
- *
- * 100% compatible with `POLIMI_LOGIN_FLOW_SPEC` in PoliRecord (`src/shared/login-flow-spec.ts`).
+ * Specification of the Politecnico di Milano (aunicalogin -> Authenticated Session)
+ * and Federated SAML 2.0 SSO login flows.
  */
 
 export const POLIMI_LOGIN_FLOW_SPEC = {
   /**
    * Step 1: Initial entry URLs and session-expired recovery behavior.
    *
-   * Live observation:
    * - Opening bare `https://aunicalogin.polimi.it/aunicalogin/` without a target `id_servizio`
    *   or with a stale session cookie renders `SessioneTerminataLogoutSSO.do` displaying
    *   `.alert-danger` ("Violazione della sicurezza") and `.alert-success` ("Logout effettuato")
    *   with 0 forms.
-   * - Opening a service with an expired session redirects (302) to
+   * - Opening a session with an expired cookie redirects (302) to
    *   `https://aunicalogin.polimi.it/aunicalogin/aunicalogin/controller/logout/SessioneTerminata.do?jaf_currentWFID=main&EVN_DEFAULT=evento`
    *   displaying `.alert-warning` ("Sessione di lavoro scaduta") and a primary button
    *   `a.btn-primary[href*="id_servizio=376"]` ("Continua").
    * - Requesting `https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376`
-   *   (or `https://www.polimi.it/servizi-online`) performs a 302 redirect to
+   *   performs a 302 redirect to
    *   `https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp?id_servizio=376&profile=0&__pj0=0&__pj1=<HMAC>`
-   *   which renders the "Servizi online" (`id_servizio=376`) login form.
+   *   which renders the Politecnico di Milano SSO login form.
    */
   entry: {
     requestedUrl: 'https://aunicalogin.polimi.it/aunicalogin/',
     serviceEntryUrl:
       'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376',
     onlineServicesShortcutUrl: 'https://www.polimi.it/servizi-online',
-    serviziOnlineServiceId: '376',
-    recordingsArchiveServiceId: '2314',
-    webexServiceId: '2070',
-    webexIdpServiceId: '436',
+    ssoPortalServiceId: '376',
     sessionExpiredSelectors: {
       continueToPortalLink:
         'a.btn-primary[href*="id_servizio=376"], a[role="button"][href*="id_servizio=376"]',
@@ -45,8 +39,6 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
   /**
    * Step 2: PoliMi Credentials Page ("Polimi - Autenticazione").
    *
-   * URL: `https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp?id_servizio=376&profile=0&__pj0=0&__pj1=<HMAC>`
-   * Form POST action: `/aunicalogin/aunicalogin/controller/IdentificazioneUnica.do?&jaf_currentWFID=main&polij_step=0&__pj0=0&__pj1=<HMAC>`
    * Note: The form contains a hidden submit button `button.jaf-visually-hidden[name="evn_conferma"]`
    * as its first element and a visible submit button `.aunicalogin-button-accedi button[name="evn_conferma"]` ("Accedi").
    */
@@ -83,29 +75,23 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
   },
 
   /**
-   * Step 4: Online Services Portal ("Portale servizi" on `servizionline.polimi.it`).
+   * Step 4: Authenticated PoliMi SSO Session ("Portale servizi" on `servizionline.polimi.it`
+   * or any authenticated `polimi.it` session).
    */
-  portalPage: {
-    hostname: 'servizionline.polimi.it',
-    pathnameSubstring: '/portaleservizi/',
-    titleSubstring: 'Portale servizi',
-    searchServiceInputSelector: 'input.cercaServizio[name="search"]',
-    recordingArchivesLinkSelectors: [
-      'a#srv_vm_530',
-      'a#fav_vm_530',
-      'a.srv_link[href*="idServizio=2314"]',
-      'a[href*="idServizio=2314"]'
-    ],
-    recordingArchivesTextMatchers: [
-      'recordings archive',
-      'recording archives',
-      'archivio registrazioni didattica',
-      'archivio registrazioni'
+  authenticatedSession: {
+    portalHostname: 'servizionline.polimi.it',
+    portalPathnameSubstring: '/portaleservizi/',
+    portalTitleSubstring: 'Portale servizi',
+    authenticatedDomSelectors: [
+      'input.cercaServizio[name="search"]',
+      'a[href*="Logout.do"]',
+      'a[href*="evn_logout"]',
+      '.jaf-user-info'
     ]
   },
 
   /**
-   * Step 5: Webex SAML SSO Email Entry ("Sign In - Webex" on `idbroker-eu.webex.com`).
+   * Federated SAML SSO Email Discovery ("Sign In - Webex" on `idbroker-eu.webex.com`).
    */
   webexSsoPage: {
     hostnames: ['idbroker-eu.webex.com', 'idbroker.webex.com'],

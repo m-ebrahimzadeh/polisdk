@@ -1,7 +1,7 @@
 {
   "name": "@polisdk/poliauth",
-  "version": "1.0.0",
-  "description": "Standalone authentication, 2FA TOTP, AES-256-GCM credential vault, federated SAML SSO, session management, user identity persistence, and authorization library for Politecnico di Milano applications.",
+  "version": "2.0.0",
+  "description": "Standalone, platform-agnostic authentication, RFC 6238 TOTP/2FA, Web Crypto AES-256-GCM credential & session vault, federated SAML SSO, user identity persistence, and RBAC authorization core for the PoliSDK ecosystem.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -30,9 +30,6 @@
     "./storage": {
       "types": "./dist/storage/index.d.ts",
       "import": "./dist/storage/index.js"
-    },
-    "./browser-bundle": {
-      "import": "./dist/injected-auth-adapters.iife.js"
     }
   },
   "files": [
@@ -50,18 +47,6 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
-  "peerDependencies": {
-    "better-sqlite3": ">=9.0.0",
-    "playwright": ">=1.40.0"
-  },
-  "peerDependenciesMeta": {
-    "better-sqlite3": {
-      "optional": true
-    },
-    "playwright": {
-      "optional": true
-    }
-  },
   "keywords": [
     "polimi",
     "polisdk",
@@ -72,9 +57,7 @@
     "totp",
     "2fa",
     "aes-256-gcm",
-    "vault",
-    "playwright",
-    "chrome-extension"
+    "vault"
   ],
   "license": "MIT"
 }

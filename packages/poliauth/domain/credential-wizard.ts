@@ -1,22 +1,18 @@
 /**
  * @module @polisdk/poliauth/domain/credential-wizard
- * Framework-Agnostic Interactive Credential Onboarding Wizard State Machine.
- *
- * Extracted from `polirecord/src/bot/telegram/handlers/auth-handlers.ts` so any UI
- * (Telegram Bot, CLI, Discord Bot, or Web onboarding flow) can drive step-by-step
- * encrypted credential collection without duplicating validation or state transitions.
+ * Platform-Agnostic Interactive Credential Onboarding Wizard State Machine.
  */
 
 import {
   maskPersonCode,
   maskPolimiEmail
-} from './credentials';
+} from './credentials.js';
 import {
   normalizeIdentityId,
   type IdentityId,
   type SavedVaultCredentials
-} from './entities';
-import { cleanTotpSecret, isValidTotpSecret } from './totp';
+} from './entities.js';
+import { cleanTotpSecret, isValidTotpSecret } from './totp.js';
 
 export type WizardStep = 'person_code' | 'password' | 'email' | 'totp_secret';
 
@@ -26,7 +22,6 @@ export interface WizardSessionState {
   personCode: string;
   password: string;
   polimiEmail: string;
-  promptMessageId?: number | string;
   startedAt: number;
 }
 
@@ -55,17 +50,13 @@ export type WizardTransitionResult =
 export class CredentialSetupWizard {
   private readonly sessions = new Map<string, WizardSessionState>();
 
-  public startSession(
-    userId: IdentityId,
-    promptMessageId?: number | string
-  ): WizardSessionState {
+  public startSession(userId: IdentityId): WizardSessionState {
     const state: WizardSessionState = {
       userId,
       step: 'person_code',
       personCode: '',
       password: '',
       polimiEmail: '',
-      promptMessageId,
       startedAt: Date.now()
     };
     this.sessions.set(normalizeIdentityId(userId), state);
@@ -78,16 +69,6 @@ export class CredentialSetupWizard {
 
   public hasActiveSession(userId: IdentityId): boolean {
     return this.sessions.has(normalizeIdentityId(userId));
-  }
-
-  public updatePromptMessageId(
-    userId: IdentityId,
-    promptMessageId: number | string
-  ): void {
-    const session = this.getSession(userId);
-    if (session) {
-      session.promptMessageId = promptMessageId;
-    }
   }
 
   public cancelSession(userId: IdentityId): void {

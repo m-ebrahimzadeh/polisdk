@@ -1,16 +1,23 @@
 import type { AuthLoggerPort } from '../interfaces/logger-port.js';
 
 const SENSITIVE_QUERY_PARAM_REGEX =
-  /([?&](?:__pj1|jaf_currentWFID|ticket|recordingViewerInfoToken|RCID|password|otp|secret)=)[^&\s#]+/gi;
+  /([?&](?:__pj1|jaf_currentWFID|ticket|SAMLRequest|SAMLResponse|password|otp|secret)=)[^&\s#]+/gi;
 
-const TELEGRAM_BOT_TOKEN_REGEX = /\b\d{8,11}:[A-Za-z0-9_-]{35}\b/g;
+export interface RedactionRule {
+  pattern: RegExp;
+  replacement: string;
+}
 
 /**
- * Redacts sensitive PoliMi JAF tokens (`__pj1`, `jaf_currentWFID`), CAS/SAML tickets (`ticket`),
- * Webex tokens (`recordingViewerInfoToken`, `RCID`), credential query parameters,
- * Telegram Bot API tokens, and any caller-supplied `extraSecrets` from log/error text.
+ * Redacts sensitive PoliMi JAF tokens (`__pj1`, `jaf_currentWFID`), CAS/SAML tickets (`ticket`,
+ * `SAMLRequest`, `SAMLResponse`), credential query parameters, caller-supplied `extraSecrets`,
+ * and optional custom regex rules from log/error text.
  */
-export function redactSecrets(text: string, extraSecrets: string[] = []): string {
+export function redactSecrets(
+  text: string,
+  extraSecrets: string[] = [],
+  customRules: RedactionRule[] = []
+): string {
   let out = text;
   for (const secret of extraSecrets) {
     if (secret && secret.length >= 4) {
@@ -18,7 +25,9 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): string
     }
   }
   out = out.replace(SENSITIVE_QUERY_PARAM_REGEX, '$1[REDACTED]');
-  out = out.replace(TELEGRAM_BOT_TOKEN_REGEX, '[REDACTED_BOT_TOKEN]');
+  for (const rule of customRules) {
+    out = out.replace(rule.pattern, rule.replacement);
+  }
   return out;
 }
 
@@ -27,18 +36,19 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): string
  */
 export function createRedactingLogger(
   delegate: AuthLoggerPort,
-  extraSecrets: string[] = []
+  extraSecrets: string[] = [],
+  customRules: RedactionRule[] = []
 ): AuthLoggerPort {
   const sanitizeMeta = (meta: unknown[]): unknown[] =>
     meta.map((item) => {
       if (typeof item === 'string') {
-        return redactSecrets(item, extraSecrets);
+        return redactSecrets(item, extraSecrets, customRules);
       }
       if (item instanceof Error) {
-        const cloned = new Error(redactSecrets(item.message, extraSecrets));
+        const cloned = new Error(redactSecrets(item.message, extraSecrets, customRules));
         cloned.name = item.name;
         if (item.stack) {
-          cloned.stack = redactSecrets(item.stack, extraSecrets);
+          cloned.stack = redactSecrets(item.stack, extraSecrets, customRules);
         }
         return cloned;
       }
@@ -47,16 +57,28 @@ export function createRedactingLogger(
 
   return {
     debug(message: string, ...meta: unknown[]) {
-      delegate.debug?.(redactSecrets(message, extraSecrets), ...sanitizeMeta(meta));
+      delegate.debug?.(
+        redactSecrets(message, extraSecrets, customRules),
+        ...sanitizeMeta(meta)
+      );
     },
     info(message: string, ...meta: unknown[]) {
-      delegate.info(redactSecrets(message, extraSecrets), ...sanitizeMeta(meta));
+      delegate.info(
+        redactSecrets(message, extraSecrets, customRules),
+        ...sanitizeMeta(meta)
+      );
     },
     warn(message: string, ...meta: unknown[]) {
-      delegate.warn(redactSecrets(message, extraSecrets), ...sanitizeMeta(meta));
+      delegate.warn(
+        redactSecrets(message, extraSecrets, customRules),
+        ...sanitizeMeta(meta)
+      );
     },
     error(message: string, ...meta: unknown[]) {
-      delegate.error(redactSecrets(message, extraSecrets), ...sanitizeMeta(meta));
+      delegate.error(
+        redactSecrets(message, extraSecrets, customRules),
+        ...sanitizeMeta(meta)
+      );
     }
   };
 }

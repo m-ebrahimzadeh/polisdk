@@ -8,15 +8,11 @@ import {
 } from '../domain/authorization.js';
 import {
   PoliAuthOrchestrator,
-  type PolimiServiceAuthRequest,
-  type PolimiServiceAuthOutcome,
+  type PolimiSessionAuthRequest,
+  type PolimiSessionAuthOutcome,
   type FederatedSamlAuthRequest,
   type FederatedSamlAuthOutcome
 } from '../domain/login-orchestrator.js';
-import {
-  PolimiServiceRegistry,
-  defaultServiceRegistry
-} from '../domain/service-registry.js';
 import type {
   VaultStoragePort,
   UserVaultStorageFactoryPort,
@@ -33,11 +29,11 @@ import { createRedactingLogger } from '../middleware/redaction.js';
 
 export interface PoliAuthConfig {
   /**
-   * Single-tenant storage backend (e.g., `ChromeLocalVaultStorage` or `InMemoryVaultStorage`).
+   * Single-tenant storage backend (defaults to `InMemoryVaultStorage` / `localStorage`).
    */
   storage?: VaultStoragePort;
   /**
-   * Multi-tenant per-user storage factory (e.g., `SqliteUserVaultStorageFactory`).
+   * Multi-tenant per-user storage factory.
    */
   userStorageFactory?: UserVaultStorageFactoryPort;
   /**
@@ -45,11 +41,11 @@ export interface PoliAuthConfig {
    */
   cryptoOptions?: VaultCryptoOptions;
   /**
-   * Optional user identity repository (`Sqlite` or `InMemory`).
+   * Optional user identity repository (defaults to `InMemoryUserIdentityRepository`).
    */
   userRepository?: UserIdentityRepositoryPort;
   /**
-   * Optional browser session pool (`PlaywrightBrowserSessionPool`).
+   * Optional browser session pool (`SessionContextPoolPort`).
    */
   sessionPool?: SessionContextPoolPort;
   /**
@@ -57,17 +53,13 @@ export interface PoliAuthConfig {
    */
   authorizationOptions?: AuthorizationServiceOptions;
   /**
-   * Optional custom PoliMi service registry.
-   */
-  serviceRegistry?: PolimiServiceRegistry;
-  /**
    * Optional structured logger (automatically wrapped with secret redaction).
    */
   logger?: AuthLoggerPort;
 }
 
 /**
- * Unified facade and Dependency Injection container for the `@polisdk/poliauth` library.
+ * Unified facade and Dependency Injection container for the `@polisdk/poliauth` core library.
  */
 export class PoliAuth {
   public readonly vault: EncryptedCredentialVault;
@@ -76,7 +68,6 @@ export class PoliAuth {
   public readonly wizard: CredentialSetupWizard;
   public readonly orchestrator: PoliAuthOrchestrator;
   public readonly authorization: AuthorizationService;
-  public readonly serviceRegistry: PolimiServiceRegistry;
   public readonly users: UserIdentityRepositoryPort;
   public readonly sessionPool?: SessionContextPoolPort;
   public readonly logger?: AuthLoggerPort;
@@ -86,7 +77,6 @@ export class PoliAuth {
     this.totp = new TotpService();
     this.otpChallenge = new OtpChallengeCoordinator({ totpGenerator: this.totp });
     this.wizard = new CredentialSetupWizard();
-    this.serviceRegistry = config.serviceRegistry ?? defaultServiceRegistry;
     this.orchestrator = new PoliAuthOrchestrator(this.otpChallenge);
     this.authorization = new AuthorizationService(config.authorizationOptions);
     this.users = config.userRepository ?? new InMemoryUserIdentityRepository();
@@ -101,16 +91,17 @@ export class PoliAuth {
   }
 
   /**
-   * Executes the 5-stage PoliMi authentication and service navigation state machine.
+   * Executes the Politecnico di Milano authentication state machine until an
+   * authenticated PoliMi session is established.
    */
-  async authenticatePolimiService(
-    request: PolimiServiceAuthRequest
-  ): Promise<PolimiServiceAuthOutcome> {
-    return this.orchestrator.authenticateToService(request);
+  async authenticate(
+    request: PolimiSessionAuthRequest
+  ): Promise<PolimiSessionAuthOutcome> {
+    return this.orchestrator.authenticate(request);
   }
 
   /**
-   * Executes the multi-hop Federated SAML 2.0 SSO flow (e.g., Webex <-> PoliMi IdP).
+   * Executes the multi-hop Federated SAML 2.0 SSO flow.
    */
   async authenticateFederatedSaml(
     request: FederatedSamlAuthRequest

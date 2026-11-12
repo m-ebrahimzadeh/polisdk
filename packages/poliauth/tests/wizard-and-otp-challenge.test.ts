@@ -8,7 +8,7 @@ describe('CredentialSetupWizard & OtpChallengeCoordinator', () => {
     const wizard = new CredentialSetupWizard();
     const userId = 1001;
 
-    const initial = wizard.startSession(userId, 999);
+    const initial = wizard.startSession(userId);
     expect(initial.step).toBe('person_code');
     expect(wizard.hasActiveSession(userId)).toBe(true);
 

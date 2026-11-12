@@ -7,8 +7,7 @@ import type {
   FederatedSsoInspectionResult,
   IdentityId,
   PolimiStageInspectionResult
-} from '../domain/entities';
-import type { PolimiPortalServiceDescriptor } from '../domain/service-registry';
+} from '../domain/entities.js';
 
 /**
  * Minimal URL/Location snapshot independent of browser globals.
@@ -22,8 +21,6 @@ export interface PageLocationSnapshot {
 
 /**
  * Driver port abstracting a single browser page/tab during authentication.
- * Can be implemented over Playwright `Page`, Chrome Extension `chrome.tabs` + content scripts,
- * Puppeteer, or JSDOM `Document` for unit testing.
  */
 export interface AuthPageDriverPort {
   /**
@@ -37,11 +34,10 @@ export interface AuthPageDriverPort {
   waitForNavigation(timeoutMs?: number): Promise<void>;
 
   /**
-   * Inspects the current PoliMi authentication / portal / service stage.
+   * Inspects the current PoliMi authentication stage (`authenticated`, `otp`,
+   * `credentials`, `sso_handoff`, `session_expired`, or `unknown`).
    */
-  inspectPolimiStage(
-    targetService?: PolimiPortalServiceDescriptor
-  ): Promise<PolimiStageInspectionResult>;
+  inspectPolimiStage(): Promise<PolimiStageInspectionResult>;
 
   /**
    * Recovers from bare `/aunicalogin/` security violation or expired session pages.
@@ -63,22 +59,14 @@ export interface AuthPageDriverPort {
   submitOtp(params: { otp: string }): Promise<{ ok: boolean; error?: string }>;
 
   /**
-   * Clicks a target service link (defaulting to Recording Archives `idServizio=2314`)
-   * on the PoliMi Online Services Portal (`Portale.do`).
+   * Inspects whether the page is on a federated SAML SSO login prompt.
    */
-  openPortalService(
-    service?: PolimiPortalServiceDescriptor
-  ): Promise<{ ok: boolean; href?: string; error?: string }>;
+  inspectFederatedSsoPage?(): Promise<FederatedSsoInspectionResult>;
 
   /**
-   * Inspects whether the page is on a federated SAML SSO login prompt (e.g. Webex `doSSO.jsp`).
+   * Submits the user's institutional email on a federated SAML SSO discovery page.
    */
-  inspectFederatedSsoPage(): Promise<FederatedSsoInspectionResult>;
-
-  /**
-   * Submits the user's PoliMi email on the federated SAML SSO discovery page (`#IDToken1`).
-   */
-  submitFederatedEmailLogin(
+  submitFederatedEmailLogin?(
     email: string
   ): Promise<{ ok: boolean; error?: string }>;
 }
@@ -115,7 +103,7 @@ export interface SessionContextPoolPort<TContext = unknown, TPage = unknown> {
   saveUserContextState(userId: IdentityId): Promise<void>;
   destroyUserContext(
     userId: IdentityId,
-    options?: { skipSaveState?: boolean }
+    options?: { skipSaveState?: boolean; clearPersistedState?: boolean }
   ): Promise<void>;
   evictExpiredContexts(): Promise<void>;
   getStats(): SessionPoolStats;

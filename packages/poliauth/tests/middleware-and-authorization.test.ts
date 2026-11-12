@@ -1,10 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AuthorizationService } from '../domain/authorization.js';
-import {
-  createTelegramAuthMiddleware,
-  deleteSensitiveTelegramMessage,
-  type TelegramContextLike
-} from '../middleware/telegram-middleware.js';
+import { createAuthMiddleware } from '../middleware/auth-middleware.js';
 import { redactSecrets, createRedactingLogger } from '../middleware/redaction.js';
 import { InMemoryUserIdentityRepository, InMemoryVaultStorage } from '../storage/memory-storage.js';
 import { PoliAuth } from '../src/poliauth-client.js';
@@ -12,8 +8,8 @@ import { PoliAuth } from '../src/poliauth-client.js';
 describe('AuthorizationService, Middleware, Secret Redaction & PoliAuth Facade', () => {
   it('enforces private channel guard, allowlist, admin roles, and pluggable resource ownership policies', async () => {
     const ownedResources = new Map<string, number>([
-      ['transfer-100', 1001],
-      ['transfer-200', 2002]
+      ['doc-100', 1001],
+      ['doc-200', 2002]
     ]);
 
     const authz = new AuthorizationService({
@@ -28,7 +24,7 @@ describe('AuthorizationService, Middleware, Secret Redaction & PoliAuth Facade',
       }
     });
 
-    // Group chat denied even for allowlisted user
+    // Non-private channel denied even for allowlisted user
     const groupDecision = authz.evaluateChannelAndUserAccess({
       userId: 1001,
       isPrivateChannel: false
@@ -36,7 +32,7 @@ describe('AuthorizationService, Middleware, Secret Redaction & PoliAuth Facade',
     expect(groupDecision.allowed).toBe(false);
     expect(groupDecision.reasonCode).toBe('NON_PRIVATE_CHANNEL');
 
-    // Non-allowlisted user denied in private chat
+    // Non-allowlisted user denied
     const strangerDecision = authz.evaluateChannelAndUserAccess({
       userId: 3333,
       isPrivateChannel: true
@@ -62,99 +58,103 @@ describe('AuthorizationService, Middleware, Secret Redaction & PoliAuth Facade',
 
     // Resource ownership check
     const ownResource = await authz.authorizeResource(1001, {
-      resourceType: 'transfer',
-      resourceId: 'transfer-100'
+      resourceType: 'document',
+      resourceId: 'doc-100'
     });
     expect(ownResource.allowed).toBe(true);
 
     const otherResource = await authz.authorizeResource(1001, {
-      resourceType: 'transfer',
-      resourceId: 'transfer-200'
+      resourceType: 'document',
+      resourceId: 'doc-200'
     });
     expect(otherResource.allowed).toBe(false);
     expect(otherResource.reasonCode).toBe('RESOURCE_FORBIDDEN');
 
     // Admin bypasses resource ownership restriction
     const adminResource = await authz.authorizeResource(9999, {
-      resourceType: 'transfer',
-      resourceId: 'transfer-200'
+      resourceType: 'document',
+      resourceId: 'doc-200'
     });
     expect(adminResource.allowed).toBe(true);
   });
 
-  it('enforces Telegram auth middleware and provisions authorized users automatically', async () => {
+  it('enforces framework-agnostic auth middleware and provisions authorized users automatically', async () => {
     const userRepo = new InMemoryUserIdentityRepository();
     const authz = new AuthorizationService({
       allowedUserIds: [1001]
     });
 
-    const middleware = createTelegramAuthMiddleware({
+    interface MockRequestContext {
+      actorId?: number;
+      username?: string;
+      displayName?: string;
+      isPrivate: boolean;
+      deniedReason?: string;
+    }
+
+    const middleware = createAuthMiddleware<MockRequestContext>({
       authorization: authz,
-      userRepository: userRepo
+      userRepository: userRepo,
+      extractSubject: (ctx) => ({
+        userId: ctx.actorId,
+        username: ctx.username,
+        displayName: ctx.displayName,
+        isPrivateChannel: ctx.isPrivate
+      }),
+      onDenied: (ctx, decision) => {
+        ctx.deniedReason = decision.reasonCode;
+      }
     });
 
-    const replies: string[] = [];
     let nextCalled = false;
 
-    // 1. Group chat rejected
-    const groupCtx: TelegramContextLike = {
-      from: { id: 1001, username: 'alice', first_name: 'Alice' },
-      chat: { id: -500, type: 'group' },
-      async reply(text) {
-        replies.push(text);
-      }
+    // 1. Non-private channel rejected
+    const publicCtx: MockRequestContext = {
+      actorId: 1001,
+      username: 'alice',
+      displayName: 'Alice',
+      isPrivate: false
     };
-    await middleware(groupCtx, async () => {
+    await middleware(publicCtx, async () => {
       nextCalled = true;
     });
     expect(nextCalled).toBe(false);
-    expect(replies[0]).toContain('private');
+    expect(publicCtx.deniedReason).toBe('NON_PRIVATE_CHANNEL');
 
     // 2. Non-allowlisted user rejected
-    replies.length = 0;
-    const unauthCtx: TelegramContextLike = {
-      from: { id: 7777, username: 'mallory', first_name: 'Mallory' },
-      chat: { id: 7777, type: 'private' },
-      async reply(text) {
-        replies.push(text);
-      }
+    const unauthCtx: MockRequestContext = {
+      actorId: 7777,
+      username: 'mallory',
+      displayName: 'Mallory',
+      isPrivate: true
     };
     await middleware(unauthCtx, async () => {
       nextCalled = true;
     });
     expect(nextCalled).toBe(false);
-    expect(replies[0]).toContain('7777');
+    expect(unauthCtx.deniedReason).toBe('NOT_IN_ALLOWLIST');
 
-    // 3. Allowlisted user in private chat allowed and provisioned in repository
-    const validCtx: TelegramContextLike = {
-      from: { id: 1001, username: 'alice', first_name: 'Alice' },
-      chat: { id: 1001, type: 'private' },
-      message: { message_id: 55, text: 'MySecretPassword' },
-      api: {
-        async deleteMessage() {
-          return true;
-        }
-      },
-      async reply(text) {
-        replies.push(text);
-      }
+    // 3. Allowlisted user in private channel allowed and provisioned in repository
+    const validCtx: MockRequestContext = {
+      actorId: 1001,
+      username: 'alice',
+      displayName: 'Alice',
+      isPrivate: true
     };
     await middleware(validCtx, async () => {
       nextCalled = true;
     });
     expect(nextCalled).toBe(true);
     expect(userRepo.getUser(1001)?.username).toBe('alice');
-    expect(await deleteSensitiveTelegramMessage(validCtx)).toBe(true);
   });
 
-  it('redacts sensitive JAF, SAML, Webex, and Telegram Bot tokens in redactSecrets and createRedactingLogger', () => {
+  it('redacts sensitive JAF, SAML, and custom secrets in redactSecrets and createRedactingLogger', () => {
     const rawUrl =
-      'https://onlineservices.polimi.it/archivioregistrazioni/Archivio.do?jaf_currentWFID=wf12345&__pj1=tok999&recordingViewerInfoToken=webexTok&ticket=ST-12345';
+      'https://aunicalogin.polimi.it/aunicalogin/IdentificazioneUnica.do?jaf_currentWFID=wf12345&__pj1=tok999&ticket=ST-12345';
     const redacted = redactSecrets(rawUrl, ['SuperSecretPassword123']);
 
     expect(redacted).not.toContain('wf12345');
     expect(redacted).not.toContain('tok999');
-    expect(redacted).not.toContain('webexTok');
     expect(redacted).not.toContain('ST-12345');
     expect(redacted).toContain('jaf_currentWFID=[REDACTED]');
     expect(redacted).toContain('__pj1=[REDACTED]');
@@ -175,13 +175,12 @@ describe('AuthorizationService, Middleware, Secret Redaction & PoliAuth Facade',
           loggedMessages.push(msg);
         }
       },
-      ['MyVaultPassword!']
+      ['MyVaultPassword!'],
+      [{ pattern: /API_KEY_[A-Z0-9]+/g, replacement: '[REDACTED_API_KEY]' }]
     );
 
-    safeLogger.info(
-      'Bot token 123456789:AAHfiqksKZ8WmR2zS9xY0pL1mN2bV3cX4zA and pass MyVaultPassword!'
-    );
-    expect(loggedMessages[0]).toContain('[REDACTED_BOT_TOKEN]');
+    safeLogger.info('Using API_KEY_SECRET123 and pass MyVaultPassword!');
+    expect(loggedMessages[0]).toContain('[REDACTED_API_KEY]');
     expect(loggedMessages[0]).not.toContain('MyVaultPassword!');
   });
 

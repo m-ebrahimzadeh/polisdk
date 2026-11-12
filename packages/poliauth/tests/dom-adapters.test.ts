@@ -2,24 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { JSDOM } from 'jsdom';
 import {
   isPolimiLoginPage,
-  isPolimiArchivePage,
-  isPolimiTargetServicePage,
+  isPolimiAuthenticatedSessionPage,
   inspectPolimiPageStage,
   recoverPolimiSessionPage,
   submitPolimiCredentials,
-  submitPolimiOtp,
-  clickPortalService,
-  clickRecordingArchivesOnPortal
+  submitPolimiOtp
 } from '../adapters/polimi-dom-adapter.js';
 import {
   isWebexEmailSsoPage,
   inspectWebexSsoPage,
   submitWebexEmailLogin
 } from '../adapters/webex-sso-dom-adapter.js';
-import { WEBEEP_SERVICE } from '../domain/service-registry.js';
-import { getInjectedAuthAdapterBundleCode } from '../adapters/injected-auth-bundle.js';
+import { DomAuthPageDriver } from '../adapters/dom-page-driver.js';
 
-describe('PoliMi & Webex SAML SSO DOM Adapters', () => {
+describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
   it('detects and recovers from Stage 0 SessioneTerminata security violation page', () => {
     const dom = new JSDOM(
       `<!DOCTYPE html>
@@ -65,7 +61,7 @@ describe('PoliMi & Webex SAML SSO DOM Adapters', () => {
           </div>
         </body>
       </html>`,
-      { url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp?id_servizio=2314' }
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp?id_servizio=376' }
     );
 
     const stage = inspectPolimiPageStage(dom.window.document, dom.window.location);
@@ -152,69 +148,32 @@ describe('PoliMi & Webex SAML SSO DOM Adapters', () => {
     expect((doc.querySelector('#otp') as HTMLInputElement).value).toBe('654321');
   });
 
-  it('detects Stage 3 Servizi Online portal and clicks target service link (both Recordings Archive and custom services)', () => {
+  it('detects authenticated PoliMi session page without coupling to downstream portal services', async () => {
     const dom = new JSDOM(
       `<!DOCTYPE html>
       <html>
         <body>
           <h1>Servizi Online</h1>
-          <a id="arch-link" href="/portaleservizi/portaleservizi/controller/servizi/Servizi.do?evn_srv=evento&idServizio=2314">
-            Archivio registrazioni didattica
-          </a>
-          <a id="webeep-link" href="/portaleservizi/portaleservizi/controller/servizi/Servizi.do?evn_srv=evento&idServizio=2166">
-            WeBeep
-          </a>
+          <input class="cercaServizio" name="search" />
+          <a href="/portaleservizi/Logout.do">Esci</a>
         </body>
       </html>`,
       { url: 'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do' }
     );
 
     const doc = dom.window.document;
-    expect(inspectPolimiPageStage(doc, dom.window.location).stage).toBe('portal');
-
-    let archiveClicked = false;
-    doc.querySelector('#arch-link')?.addEventListener('click', (e) => {
-      e.preventDefault();
-      archiveClicked = true;
-    });
-
-    const archRes = clickRecordingArchivesOnPortal(doc);
-    expect(archRes.ok).toBe(true);
-    expect(archiveClicked).toBe(true);
-
-    let webeepClicked = false;
-    doc.querySelector('#webeep-link')?.addEventListener('click', (e) => {
-      e.preventDefault();
-      webeepClicked = true;
-    });
-
-    const webeepRes = clickPortalService(doc, WEBEEP_SERVICE);
-    expect(webeepRes.ok).toBe(true);
-    expect(webeepClicked).toBe(true);
-  });
-
-  it('detects Stage 4 authenticated target service page', () => {
-    const dom = new JSDOM(
-      `<!DOCTYPE html>
-      <html>
-        <body>
-          <h1>Archivio registrazioni didattica</h1>
-          <select name="aa"><option value="2024">2024/2025</option></select>
-        </body>
-      </html>`,
-      {
-        url: 'https://onlineservices.polimi.it/archivioregistrazioni/archivioregistrazioni/controller/ArchivioListActivity.do'
-      }
-    );
-
-    const doc = dom.window.document;
     const loc = dom.window.location;
-    expect(isPolimiArchivePage(doc, loc)).toBe(true);
-    expect(isPolimiTargetServicePage(doc, loc)).toBe(true);
-    expect(inspectPolimiPageStage(doc, loc).stage).toBe('archive');
+    expect(isPolimiAuthenticatedSessionPage(doc, loc)).toBe(true);
+    expect(inspectPolimiPageStage(doc, loc).stage).toBe('authenticated');
+
+    const driver = new DomAuthPageDriver({
+      getDocument: () => doc,
+      getLocation: () => loc
+    });
+    expect((await driver.inspectPolimiStage()).stage).toBe('authenticated');
   });
 
-  it('handles Stage 5 Webex SAML SSO email prompt and dispatches input/change/blur events to enable #IDButton2', () => {
+  it('handles Federated SAML SSO email prompt and dispatches input/change/blur events to enable #IDButton2', () => {
     const dom = new JSDOM(
       `<!DOCTYPE html>
       <html>
@@ -257,28 +216,5 @@ describe('PoliMi & Webex SAML SSO DOM Adapters', () => {
     expect(eventsFired).toEqual(['input', 'change', 'blur']);
     expect(nextButton.disabled).toBe(false);
     expect(buttonClicked).toBe(true);
-  });
-
-  it('compiles and evaluates the self-contained IIFE injected adapter bundle in a browser window', () => {
-    const bundleCode = getInjectedAuthAdapterBundleCode();
-    expect(bundleCode.length).toBeGreaterThan(500);
-
-    const dom = new JSDOM(`<!DOCTYPE html><html><body><input id="otp" name="otp" /></body></html>`, {
-      url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do',
-      runScripts: 'outside-only'
-    });
-
-    dom.window.eval(bundleCode);
-    const injected = (dom.window as unknown as { __PoliAuthAdapters: Record<string, any> })
-      .__PoliAuthAdapters;
-    expect(injected).toBeDefined();
-    expect(typeof injected.polimi.inspectPolimiPageStage).toBe('function');
-    expect(typeof injected.webexSso.submitWebexEmailLogin).toBe('function');
-
-    const stage = injected.polimi.inspectPolimiPageStage(
-      dom.window.document,
-      dom.window.location
-    );
-    expect(stage.stage).toBe('otp');
   });
 });

@@ -2,17 +2,12 @@ import type {
   PolimiStageInspectionResult,
   FederatedSsoInspectionResult
 } from '../domain/entities.js';
-import {
-  type PolimiPortalServiceDescriptor,
-  RECORDINGS_ARCHIVE_SERVICE
-} from '../domain/service-registry.js';
 import type { AuthPageDriverPort, PageLocationSnapshot } from '../interfaces/browser-driver-port.js';
 import {
   inspectPolimiPageStage,
   recoverPolimiSessionPage,
   submitPolimiCredentials,
-  submitPolimiOtp,
-  clickPortalService
+  submitPolimiOtp
 } from './polimi-dom-adapter.js';
 import {
   inspectWebexSsoPage,
@@ -37,18 +32,14 @@ export interface DomAuthPageDriverOptions {
    */
   onWaitForNavigation?: (timeoutMs?: number) => Promise<void> | void;
   /**
-   * Optional default target service descriptor for portal/service recognition.
+   * Optional CSS selector for authenticated federated SP pages.
    */
-  targetService?: PolimiPortalServiceDescriptor;
-  /**
-   * Optional CSS selector for authenticated Webex pages.
-   */
-  webexAuthenticatedSelector?: string;
+  federatedAuthenticatedSelector?: string;
 }
 
 /**
  * Direct DOM implementation of `AuthPageDriverPort`.
- * Ideal for browser extension content scripts and JSDOM integration tests.
+ * Ideal for browser contexts and JSDOM integration tests.
  */
 export class DomAuthPageDriver implements AuthPageDriverPort {
   private readonly options: DomAuthPageDriverOptions;
@@ -73,13 +64,10 @@ export class DomAuthPageDriver implements AuthPageDriverPort {
     }
   }
 
-  async inspectPolimiStage(
-    targetService?: PolimiPortalServiceDescriptor
-  ): Promise<PolimiStageInspectionResult> {
+  async inspectPolimiStage(): Promise<PolimiStageInspectionResult> {
     return inspectPolimiPageStage(
       this.options.getDocument(),
-      this.options.getLocation(),
-      targetService ?? this.options.targetService ?? RECORDINGS_ARCHIVE_SERVICE
+      this.options.getLocation()
     );
   }
 
@@ -103,20 +91,9 @@ export class DomAuthPageDriver implements AuthPageDriverPort {
     return submitPolimiOtp(this.options.getDocument(), params);
   }
 
-  async openPortalService(
-    service: PolimiPortalServiceDescriptor = RECORDINGS_ARCHIVE_SERVICE
-  ): Promise<{ ok: boolean; href?: string; error?: string }> {
-    const res = clickPortalService(this.options.getDocument(), service);
-    if (!res.ok && res.href && this.options.onNavigate) {
-      await this.options.onNavigate(res.href);
-      return { ok: true, href: res.href };
-    }
-    return res;
-  }
-
   async inspectFederatedSsoPage(): Promise<FederatedSsoInspectionResult> {
     return inspectWebexSsoPage(this.options.getDocument(), this.options.getLocation(), {
-      authenticatedSelector: this.options.webexAuthenticatedSelector
+      authenticatedSelector: this.options.federatedAuthenticatedSelector
     });
   }
 

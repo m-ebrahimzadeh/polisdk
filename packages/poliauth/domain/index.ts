@@ -1,14 +1,8 @@
-/**
- * @module @polisdk/poliauth/domain
- * Public Domain Layer Exports for PoliAuth.
- */
-
-export * from './entities';
-export * from './credentials';
-export * from './login-flow-spec';
-export * from './service-registry';
-export * from './totp';
-export * from './otp-challenge';
-export * from './credential-wizard';
-export * from './authorization';
-export * from './login-orchestrator';
+export * from './entities.js';
+export * from './credentials.js';
+export * from './login-flow-spec.js';
+export * from './totp.js';
+export * from './otp-challenge.js';
+export * from './credential-wizard.js';
+export * from './authorization.js';
+export * from './login-orchestrator.js';

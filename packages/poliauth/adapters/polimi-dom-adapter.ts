@@ -3,10 +3,6 @@ import type {
   PolimiPageStage,
   PolimiStageInspectionResult
 } from '../domain/entities.js';
-import {
-  type PolimiPortalServiceDescriptor,
-  RECORDINGS_ARCHIVE_SERVICE
-} from '../domain/service-registry.js';
 import type { PageLocationSnapshot } from '../interfaces/browser-driver-port.js';
 
 function dispatchInputEvents(el: Element): void {
@@ -46,93 +42,45 @@ export function isPolimiLoginPage(doc: Document, loc: PageLocationSnapshot): boo
 }
 
 /**
- * Checks whether the current DOM and location match a specific target PoliMi service descriptor.
+ * Checks whether the current DOM and location correspond to an authenticated Politecnico di Milano session.
  */
-export function isPolimiTargetServicePage(
+export function isPolimiAuthenticatedSessionPage(
   doc: Document,
-  loc: PageLocationSnapshot,
-  service: PolimiPortalServiceDescriptor = RECORDINGS_ARCHIVE_SERVICE
+  loc: PageLocationSnapshot
 ): boolean {
   if (isPolimiLoginPage(doc, loc)) {
     return false;
   }
 
-  if (service.requiredDomSelector && doc.querySelector(service.requiredDomSelector)) {
+  for (const selector of POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.authenticatedDomSelectors) {
+    if (doc.querySelector(selector)) {
+      return true;
+    }
+  }
+
+  if (
+    loc.hostname.includes(POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.portalHostname) ||
+    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.portalPathnameSubstring)
+  ) {
     return true;
   }
 
-  const fullUrl = getPageUrl(loc);
-  const matchesUrl = service.targetUrlSubstrings.some(
-    (sub) => fullUrl.includes(sub) || loc.pathname.includes(sub) || loc.hostname.includes(sub)
-  );
-  if (matchesUrl) {
-    if (!service.requiredDomSelector) {
-      return true;
-    }
-    if (doc.querySelector(service.requiredDomSelector)) {
-      return true;
-    }
-  }
-
-  const headings = Array.from(doc.querySelectorAll('h1, h2, h3, .jaf-title, title'));
-  return headings.some((h) => {
-    const text = (h.textContent ?? '').toLowerCase();
-    return service.portalTextMatchers.some((kw) => text.includes(kw.toLowerCase()));
-  });
+  return false;
 }
 
 /**
- * Checks whether the current DOM and location correspond to the authenticated
- * PoliMi Recordings Archive service (`idServizio=2314`).
- */
-export function isPolimiArchivePage(doc: Document, loc: PageLocationSnapshot): boolean {
-  return isPolimiTargetServicePage(doc, loc, RECORDINGS_ARCHIVE_SERVICE);
-}
-
-/**
- * Locates a link on the PoliMi Servizi Online portal matching the given `PolimiPortalServiceDescriptor`.
- */
-export function findPortalServiceLink(
-  doc: Document,
-  service: PolimiPortalServiceDescriptor = RECORDINGS_ARCHIVE_SERVICE
-): HTMLAnchorElement | null {
-  for (const selector of service.portalLinkSelectors) {
-    const el = doc.querySelector<HTMLAnchorElement>(selector);
-    if (el) return el;
-  }
-
-  const allLinks = Array.from(doc.querySelectorAll<HTMLAnchorElement>('a[href]'));
-  for (const a of allLinks) {
-    const text = (a.textContent ?? '').trim().toLowerCase();
-    const href = a.getAttribute('href') ?? '';
-    if (
-      href.includes(`idServizio=${service.serviceId}`) ||
-      href.includes(`id_servizio=${service.serviceId}`) ||
-      service.portalTextMatchers.some((kw) => text.includes(kw.toLowerCase()))
-    ) {
-      return a;
-    }
-  }
-
-  return null;
-}
-
-/**
- * Locates the "Consultazione archivio registrazioni / Recording archives" link (`idServizio=2314`)
- * on the PoliMi Servizi Online portal.
- */
-export function findRecordingArchivesLink(doc: Document): HTMLAnchorElement | null {
-  return findPortalServiceLink(doc, RECORDINGS_ARCHIVE_SERVICE);
-}
-
-/**
- * Inspects the current PoliMi DOM and URL to determine which stage of the 5-stage
- * authentication and service navigation pipeline the browser is currently on.
+ * Inspects the current PoliMi DOM and URL to determine which stage of the
+ * authentication pipeline the browser is currently on:
+ * - `'authenticated'`: Reached an authenticated PoliMi session
+ * - `'session_expired'`: Session expired or security violation page (`SessioneTerminata`)
+ * - `'otp'`: 2FA OTP input page (`IdentificazioneUnica.do` / `IdentificazioneDFA.do`)
+ * - `'sso_handoff'`: Intermediate SSO cookie handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`)
+ * - `'credentials'`: Person Code + Password login form (`aunicalogin.jsp`)
+ * - `'unknown'`: Unrecognized or intermediate page
  */
 export function inspectPolimiPageStage(
   doc: Document,
-  loc: PageLocationSnapshot,
-  targetService: PolimiPortalServiceDescriptor = RECORDINGS_ARCHIVE_SERVICE
+  loc: PageLocationSnapshot
 ): PolimiStageInspectionResult {
   const url = getPageUrl(loc);
   const title = doc.title || '';
@@ -141,18 +89,7 @@ export function inspectPolimiPageStage(
       .querySelector(POLIMI_LOGIN_FLOW_SPEC.credentialsPage.errorAlertSelector)
       ?.textContent?.trim() || undefined;
 
-  // 1. Target service already loaded
-  if (isPolimiTargetServicePage(doc, loc, targetService)) {
-    const reportedStage: PolimiPageStage = targetService.stageName ?? 'archive';
-    return {
-      stage: reportedStage,
-      url,
-      title,
-      detectedServiceId: targetService.serviceId
-    };
-  }
-
-  // 2. Session Expired / Terminated Security Violation page
+  // 1. Session Expired / Terminated Security Violation page
   const bodyText = (doc.body?.textContent ?? '').toLowerCase();
   const continueLink = doc.querySelector<HTMLAnchorElement>(
     POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.continueToPortalLink
@@ -171,7 +108,7 @@ export function inspectPolimiPageStage(
     };
   }
 
-  // 3. Stage 2: 2FA OTP Input Page
+  // 2. Stage 2: 2FA OTP Input Page
   const otpInput = doc.querySelector<HTMLInputElement>(
     POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector
   );
@@ -184,9 +121,9 @@ export function inspectPolimiPageStage(
     };
   }
 
-  // 4. Intermediate SSO Auto-Submit Handoff (e.g. AunicaLogin.do or doSSO.jsp)
-  // Must be checked BEFORE Stage 1 credentials because aunicalogin.jsp?id_servizio=2070/2314
-  // renders both the SSO auto-submit form (`AunicaLogin.do`) and a hidden `#login`/`#password`
+  // 3. Intermediate SSO Auto-Submit Handoff (e.g. AunicaLogin.do or doSSO.jsp)
+  // Must be checked BEFORE Stage 1 credentials because aunicalogin.jsp renders both
+  // the SSO auto-submit form (`AunicaLogin.do`) and a hidden `#login`/`#password`
   // form while an SSO cookie is already active.
   const ssoForm = doc.querySelector<HTMLFormElement>(
     'form[action*="AunicaLogin.do"], form[action*="doSSO.jsp"], form[name="form1"][action*="Aunica"]'
@@ -200,7 +137,7 @@ export function inspectPolimiPageStage(
     };
   }
 
-  // 5. Stage 1: Username & Password Credentials Page
+  // 4. Stage 1: Username & Password Credentials Page
   const loginInput = doc.querySelector<HTMLInputElement>(
     POLIMI_LOGIN_FLOW_SPEC.credentialsPage.personCodeInputSelector
   );
@@ -216,21 +153,12 @@ export function inspectPolimiPageStage(
     };
   }
 
-  // 6. Stage 3: Servizi Online Portal Home
-  const portalLink = findPortalServiceLink(doc, targetService);
-  const archiveLink = findRecordingArchivesLink(doc);
-  if (
-    portalLink ||
-    archiveLink ||
-    loc.hostname.includes(POLIMI_LOGIN_FLOW_SPEC.portalPage.hostname) ||
-    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.portalPage.pathnameSubstring)
-  ) {
+  // 5. Authenticated PoliMi Session
+  if (isPolimiAuthenticatedSessionPage(doc, loc)) {
     return {
-      stage: 'portal',
+      stage: 'authenticated',
       url,
-      title,
-      hasRecordingArchivesLink: Boolean(archiveLink),
-      hasTargetServiceLink: Boolean(portalLink)
+      title
     };
   }
 
@@ -376,43 +304,6 @@ export function submitPolimiOtp(
     ok: false,
     error: 'Could not locate 2FA OTP submit button.'
   };
-}
-
-/**
- * Clicks a service link on the PoliMi Servizi Online portal matching `service`.
- */
-export function clickPortalService(
-  doc: Document,
-  service: PolimiPortalServiceDescriptor = RECORDINGS_ARCHIVE_SERVICE
-): { ok: boolean; href?: string; error?: string } {
-  const link = findPortalServiceLink(doc, service);
-  const fallbackHref = `https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/servizi/Servizi.do?evn_srv=evento&idServizio=${service.serviceId}`;
-  if (link) {
-    const href = link.href || link.getAttribute('href') || fallbackHref;
-    link.click();
-    return {
-      ok: true,
-      href
-    };
-  }
-
-  return {
-    ok: false,
-    href: fallbackHref,
-    error: `${service.name} link not found in DOM.`
-  };
-}
-
-/**
- * Clicks the "Consultazione archivio registrazioni / Recording archives" (`idServizio=2314`)
- * link on the PoliMi Servizi Online portal.
- */
-export function clickRecordingArchivesOnPortal(doc: Document): {
-  ok: boolean;
-  href?: string;
-  error?: string;
-} {
-  return clickPortalService(doc, RECORDINGS_ARCHIVE_SERVICE);
 }
 
 export type { PolimiPageStage };

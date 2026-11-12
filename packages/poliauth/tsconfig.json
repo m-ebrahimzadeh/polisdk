@@ -3,7 +3,7 @@
   "compilerOptions": {
     "rootDir": ".",
     "outDir": "./dist",
-    "types": ["chrome", "node"]
+    "types": []
   },
   "include": [
     "src/**/*.ts",
@@ -11,7 +11,10 @@
     "interfaces/**/*.ts",
     "adapters/**/*.ts",
     "middleware/**/*.ts",
-    "storage/**/*.ts",
-    "tests/**/*.ts"
+    "storage/**/*.ts"
+  ],
+  "exclude": [
+    "dist",
+    "tests"
   ]
 }
