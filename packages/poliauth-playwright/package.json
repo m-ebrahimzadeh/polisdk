@@ -1,0 +1,47 @@
+{
+  "name": "@polisdk/poliauth-playwright",
+  "version": "1.0.0",
+  "description": "Playwright browser driver, multi-tenant BrowserContext session pool, and prebuilt DOM adapter injection bundle for @polisdk/poliauth.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser-bundle": {
+      "import": "./dist/injected-auth-adapters.iife.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@polisdk/poliauth": "^2.0.0"
+  },
+  "peerDependencies": {
+    "playwright": ">=1.40.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "polisdk",
+    "poliauth",
+    "playwright",
+    "browser-automation",
+    "session-pool"
+  ],
+  "license": "MIT"
+}

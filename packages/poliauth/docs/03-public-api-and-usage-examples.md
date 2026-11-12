@@ -1,8 +1,18 @@
-# Public API Documentation & Usage Examples (`@polisdk/poliauth`)
+# Public API Documentation & Usage Examples (`PoliSDK`)
 
-## 1. Package Exports Overview
+## 1. Ecosystem Package Overview
 
-`@polisdk/poliauth` is 100% runtime-agnostic and exposes both a unified root entry point and modular subpath exports:
+| Package | Purpose | Runtime Dependencies |
+|---|---|---|
+| `@polisdk/poliauth` | Core authentication domain, application use cases, hexagonal ports, pure DOM adapters, and Web Crypto AES-256-GCM vault | Zero (Standard ES2022 + Web Crypto + DOM) |
+| `@polisdk/poliauth-playwright` | Playwright `PlaywrightAuthPageDriver`, build-time pre-bundled DOM injector, and `PlaywrightSessionContextPool` | `@polisdk/poliauth`, `playwright` (peer) |
+| `@polisdk/poliauth-chrome` | Chrome Extension MV3 `ChromeLocalVaultStorage`, `ChromeExtensionTabDriver`, and `createPoliAuthContentScriptHandler` | `@polisdk/poliauth` |
+| `@polisdk/storage-sqlite` | SQLite multi-user `PoliAuthSqliteDatabase`, `SqliteVaultStorageBackend`, `SqliteSessionStateStore`, and `resolveMasterEncryptionKey` | `@polisdk/poliauth`, `better-sqlite3` (peer) |
+| `@polisdk/telegram-auth` | Telegram Bot `createTelegramAuthMiddleware`, `deleteSensitiveTelegramMessage`, `TelegramCredentialWizard`, and `TELEGRAM_BOT_TOKEN_REDACTION_RULE` | `@polisdk/poliauth` |
+
+---
+
+## 2. Core `@polisdk/poliauth` Subpath Exports
 
 | Import Path | Contents |
 |---|---|
@@ -16,82 +26,97 @@
 
 ---
 
-## 2. Usage Example 1: Authenticating a PoliMi SSO Session
+## 3. Usage Example 1: Server-Side Multi-User Authentication (`@polisdk/poliauth` + `@polisdk/storage-sqlite` + `@polisdk/poliauth-playwright`)
 
 ```ts
+import { PoliAuth } from '@polisdk/poliauth';
 import {
-  PoliAuth,
-  DomAuthPageDriver,
-  InMemoryVaultStorage
-} from '@polisdk/poliauth';
+  PoliAuthSqliteDatabase,
+  SqliteUserVaultStorageFactory,
+  SqliteSessionStateStore,
+  resolveMasterEncryptionKey
+} from '@polisdk/storage-sqlite';
+import {
+  PlaywrightAuthPageDriver,
+  PlaywrightSessionContextPool
+} from '@polisdk/poliauth-playwright';
+
+const masterKey = resolveMasterEncryptionKey({
+  keyFilePath: './data/.master_key'
+});
+const db = new PoliAuthSqliteDatabase('./data/poliauth.sqlite');
 
 const auth = new PoliAuth({
-  storage: new InMemoryVaultStorage('my-encryption-secret')
+  userVaultFactory: new SqliteUserVaultStorageFactory(db, masterKey),
+  sessionStateStore: new SqliteSessionStateStore(db, masterKey),
+  userRepository: db
 });
 
-// 1. Encrypt and store PoliMi credentials
-await auth.saveCredentials({
-  personCode: '10987654',
-  password: 'MyPoliPassword!',
-  totpSecret: 'JBSWY3DPEHPK3PXP',
-  polimiEmail: 'mario.rossi@mail.polimi.it'
+const pool = new PlaywrightSessionContextPool({
+  sessionStateStore: new SqliteSessionStateStore(db, masterKey)
 });
 
-// 2. Authenticate against any AuthPageDriverPort implementation
-const creds = await auth.loadCredentials();
-if (!creds) throw new Error('No credentials stored.');
+// Authenticate user 1001 in an isolated Playwright context
+const managed = await pool.acquireUserContext(1001);
+try {
+  const page = await pool.getOrCreatePrimaryPage(managed);
+  const driver = new PlaywrightAuthPageDriver(page);
+  const creds = await auth.loadCredentials(1001);
+  if (!creds) throw new Error('User credentials not configured');
 
-const driver = new DomAuthPageDriver({
-  getDocument: () => document,
-  getLocation: () => window.location,
-  onNavigate: (url) => {
-    window.location.href = url;
+  const outcome = await auth.authenticate({
+    userId: 1001,
+    driver,
+    credentials: creds
+  });
+
+  if (outcome.ok) {
+    await pool.saveUserContextState(1001);
   }
-});
-
-const outcome = await auth.authenticate({
-  userId: 'student-1',
-  driver,
-  credentials: creds
-});
-
-if (!outcome.ok) {
-  throw new Error(`Authentication failed: ${outcome.error}`);
+} finally {
+  pool.releaseUserContext(1001);
 }
-console.log('Authenticated PoliMi session at:', outcome.url);
 ```
 
 ---
 
-## 3. Usage Example 2: Framework-Agnostic Auth Middleware & Interactive Wizard
+## 4. Usage Example 2: Chrome Extension MV3 (`@polisdk/poliauth` + `@polisdk/poliauth-chrome`)
+
+```ts
+import { PoliAuth } from '@polisdk/poliauth';
+import {
+  ChromeLocalVaultStorage,
+  ChromeExtensionTabDriver
+} from '@polisdk/poliauth-chrome';
+
+const auth = new PoliAuth({
+  storage: new ChromeLocalVaultStorage()
+});
+
+const creds = await auth.loadCredentials();
+if (creds) {
+  const driver = new ChromeExtensionTabDriver(activeTabId);
+  await auth.authenticate({
+    driver,
+    credentials: creds
+  });
+}
+```
+
+---
+
+## 5. Usage Example 3: Telegram Bot Authentication (`@polisdk/poliauth` + `@polisdk/telegram-auth`)
 
 ```ts
 import {
-  PoliAuth,
-  createAuthMiddleware
-} from '@polisdk/poliauth';
+  createTelegramAuthMiddleware,
+  TelegramCredentialWizard,
+  deleteSensitiveTelegramMessage
+} from '@polisdk/telegram-auth';
 
-interface AppRequestContext {
-  userId?: string;
-  username?: string;
-  isPrivateChannel: boolean;
-}
-
-const auth = new PoliAuth({
-  authorizationOptions: {
-    allowedUserIds: ['user-1001'],
-    adminUserIds: ['admin-1'],
-    enforcePrivateChannel: true
-  }
-});
-
-const middleware = createAuthMiddleware<AppRequestContext>({
-  authorization: auth.authorization,
-  userRepository: auth.users,
-  extractSubject: (ctx) => ({
-    userId: ctx.userId,
-    username: ctx.username,
-    isPrivateChannel: ctx.isPrivateChannel
-  })
+const wizard = new TelegramCredentialWizard();
+const authMiddleware = createTelegramAuthMiddleware({
+  allowedUserIds: [12345678],
+  userRepository: db
 });
 ```
