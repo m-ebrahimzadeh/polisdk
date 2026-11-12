@@ -22,3 +22,4 @@ Standalone, platform-agnostic authentication, 2FA (RFC 6238 TOTP & manual OTP), 
 3. [Clean Architecture & Cryptography Design](./docs/02-clean-architecture-and-refactoring-strategy.md)
 4. [Public API & Usage Examples](./docs/03-public-api-and-usage-examples.md)
 5. [Interface & Extensibility Review](./docs/04-interface-and-extensibility-review.md)
+6. [Final Architecture Validation & Scorecard](./docs/05-final-architecture-validation-and-scorecard.md)
