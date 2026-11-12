@@ -18,7 +18,8 @@ polisdk/
 └── packages/
     └── poliauth/
         ├── src/           # Unified PoliAuth client & package entrypoints
-        ├── domain/        # Domain models, TOTP, SSO flow spec & use-case orchestrators
+        ├── domain/        # Pure domain entities, credential rules, RFC 6238 TOTP & SSO specs
+        ├── application/   # Stateful use cases (PoliAuthOrchestrator, OtpChallengeCoordinator, Wizard, Authz)
         ├── interfaces/    # Hexagonal ports (Driver, Storage, Crypto, OTP, Authz, Logger)
         ├── adapters/      # Pure DOM adapters (PoliMi SSO, Federated SAML SSO, DomAuthPageDriver)
         ├── middleware/    # Framework-agnostic auth middleware & secret redaction

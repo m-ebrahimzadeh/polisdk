@@ -2,20 +2,18 @@
 
 Standalone, platform-agnostic authentication, 2FA (RFC 6238 TOTP & manual OTP), session state encryption, federated SAML 2.0 SSO, Web Crypto AES-256-GCM credential vault, and RBAC authorization core library for the **PoliSDK** platform.
 
-## Key Capabilities
+## Clean Architecture Layers
 
-- **Politecnico di Milano SSO Authentication Orchestrator (`PoliAuthOrchestrator`)**:
-  - Stage 0: `SessioneTerminata` / security violation recovery (`id_servizio=376`)
-  - Stage 1: JAF (`aunicalogin.polimi.it`) credentials submission (skipping hidden `.jaf-visually-hidden` trap buttons)
-  - Stage 2: 2FA verification via automatic RFC 6238 TOTP (with 30-second window rollover guard) and seamless fallback to interactive manual 6-digit OTP waiters (`OtpChallengeCoordinator`)
-  - Stage 3: Authenticated PoliMi SSO session verification (`stage === 'authenticated'`), cleanly decoupled from downstream service navigation
-  - Federated SAML 2.0 SSO orchestration across external Service Providers and `aunicalogin.polimi.it`
-- **100% Web Standard Encrypted Credential & Session Vault (`storage/`)**:
-  - Pure Web Crypto API (`crypto.subtle`) PBKDF2-HMAC-SHA256 (`100,000` iterations) + AES-256-GCM encryption for both credentials and serialized session states
-  - Zero Node-specific, SQLite, Playwright, Chrome, or Telegram runtime dependencies
-- **Interactive Onboarding & Security Middleware (`domain/`, `middleware/`)**:
-  - 4-step `CredentialSetupWizard` state machine (`person_code` → `password` → `email` → `totp_secret`)
-  - `AuthorizationService`, `createAuthMiddleware`, and `redactSecrets` / `createRedactingLogger`
+- **Enterprise Domain (`domain/`)**:
+  - Pure models (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`), credential validation/masking (`credentials.ts`), RFC 6238 TOTP (`totp.ts`), and PoliMi SSO specification (`POLIMI_LOGIN_FLOW_SPEC`).
+- **Application Use Cases (`application/`)**:
+  - `PoliAuthOrchestrator` (`authenticate`, `authenticateFederatedSaml`), `OtpChallengeCoordinator`, `CredentialSetupWizard`, and `AuthorizationService`.
+- **Hexagonal Ports (`interfaces/`)**:
+  - `AuthPageDriverPort`, `SessionContextPoolPort`, `VaultStoragePort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `OtpChallengeProviderPort`, `AuthorizationServicePort`, `AuthLoggerPort`.
+- **Web-Standard Storage (`storage/`)**:
+  - Pure Web Crypto API (`crypto.subtle`) PBKDF2-HMAC-SHA256 (`100,000` iterations) + AES-256-GCM encryption for credentials and session states (`EncryptedCredentialVault`, `InMemoryVaultStorage`).
+- **DOM Adapters & Middleware (`adapters/`, `middleware/`)**:
+  - `polimi-dom-adapter`, `webex-sso-dom-adapter`, `DomAuthPageDriver`, `createAuthMiddleware`, and `redactSecrets` / `createRedactingLogger`.
 
 ## Documentation
 

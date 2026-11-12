@@ -1,13 +1,13 @@
 /**
- * @module @polisdk/poliauth/domain/otp-challenge
- * Two-Factor Authentication (2FA) Challenge Coordinator.
+ * @module @polisdk/poliauth/application/otp-challenge
+ * Two-Factor Authentication (2FA) Challenge Coordinator (Application Layer Use Case).
  *
  * Manages automatic TOTP derivation (with rollover guard) and asynchronous
  * manual 6-digit OTP waiters per user with bounded timeouts.
  */
 
-import { normalizeIdentityId, type IdentityId } from './entities.js';
-import { TotpService } from './totp.js';
+import { normalizeIdentityId, type IdentityId } from '../domain/entities.js';
+import { TotpService } from '../domain/totp.js';
 import type { TotpGeneratorPort } from '../interfaces/crypto-port.js';
 import type {
   LoginProgressCallbacks,
@@ -143,11 +143,7 @@ export class OtpChallengeCoordinator implements OtpChallengeProviderPort {
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingWaiters.delete(key);
-        reject(
-          new Error(
-            'Timed out waiting for 6-digit 2FA OTP.'
-          )
-        );
+        reject(new Error('Timed out waiting for 6-digit 2FA OTP.'));
       }, timeoutMs);
 
       unrefTimerIfSupported(timer);

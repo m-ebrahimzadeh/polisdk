@@ -7,7 +7,8 @@
 | Import Path | Contents |
 |---|---|
 | `@polisdk/poliauth` | Unified `PoliAuth` facade + re-exports of all core layers |
-| `@polisdk/poliauth/domain` | `PoliAuthOrchestrator`, `TotpService`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation utilities |
+| `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`), `TotpService`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation utilities |
+| `@polisdk/poliauth/application` | `PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService` |
 | `@polisdk/poliauth/interfaces` | `AuthPageDriverPort`, `SessionContextPoolPort`, `VaultStoragePort`, `UserVaultStorageFactoryPort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `OtpChallengeProviderPort`, `AuthorizationServicePort`, `AuthLoggerPort` |
 | `@polisdk/poliauth/storage` | `EncryptedCredentialVault`, `saveEncryptedCredentials`, `loadEncryptedCredentials`, `clearEncryptedCredentials`, `saveEncryptedSessionState`, `loadEncryptedSessionState`, `clearEncryptedSessionState`, `InMemoryVaultStorage`, `InMemoryUserVaultStorageFactory`, `InMemorySessionStateStore`, `InMemoryUserIdentityRepository` |
 | `@polisdk/poliauth/adapters` | `DomAuthPageDriver`, `polimi-dom-adapter`, `webex-sso-dom-adapter` |

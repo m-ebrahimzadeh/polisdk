@@ -2,11 +2,11 @@
 
 ## 1. Executive Summary
 
-`@polisdk/poliauth` is the standalone authentication core of the **PoliSDK** platform. In Phase 1, all legacy application coupling, runtime-specific infrastructure (`better-sqlite3`, `playwright`, `chrome.*`, `esbuild`, `node:fs`, `node:crypto`), Telegram bot assumptions, and downstream portal service navigation concerns were purged from the core package.
+`@polisdk/poliauth` is the standalone authentication core of the **PoliSDK** platform. In Phases 1 and 2, all legacy application coupling, runtime-specific infrastructure (`better-sqlite3`, `playwright`, `chrome.*`, `esbuild`, `node:fs`, `node:crypto`), Telegram bot assumptions, and downstream portal service navigation concerns were purged, and stateful use cases were cleanly separated into `application/` distinct from `domain/`.
 
 ---
 
-## 2. Purified `@polisdk/poliauth` Dependency Graph
+## 2. Layered Dependency Graph (`domain/` vs. `application/`)
 
 ```mermaid
 flowchart TD
@@ -15,15 +15,18 @@ flowchart TD
     Client["src/poliauth-client.ts (PoliAuth)"]
   end
 
-  subgraph Domain["Core Domain & Orchestration (domain/)"]
+  subgraph Application["Application Layer Use Cases (application/)"]
+    OtpCoord["application/otp-challenge.ts"]
+    Wizard["application/credential-wizard.ts"]
+    Authz["application/authorization.ts"]
+    Orch["application/login-orchestrator.ts"]
+  end
+
+  subgraph Domain["Pure Enterprise Domain (domain/)"]
     Entities["domain/entities.ts"]
     Creds["domain/credentials.ts"]
     FlowSpec["domain/login-flow-spec.ts"]
     Totp["domain/totp.ts"]
-    OtpCoord["domain/otp-challenge.ts"]
-    Wizard["domain/credential-wizard.ts"]
-    Authz["domain/authorization.ts"]
-    Orch["domain/login-orchestrator.ts"]
   end
 
   subgraph Ports["Hexagonal Ports (interfaces/)"]
@@ -52,24 +55,25 @@ flowchart TD
   end
 
   Index --> Client
+  Client --> Application
   Client --> Domain
   Client --> Storage
   Client --> Middleware
-  Domain --> Ports
+  Application --> Domain
+  Application --> Ports
+  Domain --> CryptoPort
+  Storage --> Domain
   Storage --> Ports
+  Adapters --> Domain
   Adapters --> Ports
   Middleware --> Ports
 ```
 
 ---
 
-## 3. Eliminated Coupling Points
+## 3. Domain vs. Application Layer Separation
 
-| Category | Removed From `@polisdk/poliauth` | Replacement / Architectural Boundary |
-| :--- | :--- | :--- |
-| **SQLite (`better-sqlite3`)** | `storage/sqlite-storage.ts`, `storage/master-key.ts` | Replaced in core by pure `VaultStoragePort`, `SessionStateStorePort`, and `UserIdentityRepositoryPort` abstractions. |
-| **Playwright (`playwright`, `esbuild`)** | `adapters/playwright-page-driver.ts`, `adapters/playwright-session-pool.ts`, `adapters/injected-auth-bundle.ts` | Replaced in core by `AuthPageDriverPort` and `SessionContextPoolPort` interfaces. |
-| **Chrome Extensions (`chrome.*`)** | `storage/chrome-storage.ts`, `adapters/chrome-tab-driver.ts`, global `chrome.runtime.id` probes | Replaced by explicit `VaultStoragePort` and `secretMaterial` dependency injection. |
-| **Telegram Bot (`grammY` / `Telegraf`)** | `middleware/telegram-middleware.ts`, `TELEGRAM_BOT_TOKEN_REGEX`, `promptMessageId`, `/login` error strings | Replaced by generic `createAuthMiddleware`, `RedactionRule[]`, and UI-neutral `CredentialSetupWizard`. |
-| **Legacy Application Naming & Services** | `polirecord_*`, `PoliRecord::*`, `RECORDINGS_ARCHIVE_SERVICE` (`2314`), `'archive'`, `'opening_recording_archives'` | Replaced by `poliauth_*` storage keys, `PoliAuth::*` KDF domain strings, and session-level `'authenticated'` termination. |
-| **Node.js Crypto (`node:crypto`, `Buffer`)** | Mixed `createCipheriv` / `Buffer` inside `storage/vault.ts` | Standardized 100% on Web Crypto API (`crypto.subtle` PBKDF2-HMAC-SHA256 + AES-256-GCM) for both credentials and session states. |
+| Layer | Directory | Files | Responsibilities |
+| :--- | :--- | :--- | :--- |
+| **Enterprise Domain** | `domain/` | `entities.ts`, `credentials.ts`, `totp.ts`, `login-flow-spec.ts` | Stateless models, value objects, credential validation/masking rules, RFC 6238 TOTP computation, and PoliMi SSO protocol specification. |
+| **Application Use Cases** | `application/` | `login-orchestrator.ts`, `otp-challenge.ts`, `credential-wizard.ts`, `authorization.ts` | Stateful workflow orchestration (`PoliAuthOrchestrator`), asynchronous 2FA challenge coordination (`OtpChallengeCoordinator`), onboarding wizard state machine (`CredentialSetupWizard`), and RBAC/resource authorization (`AuthorizationService`). |

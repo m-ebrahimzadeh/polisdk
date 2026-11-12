@@ -8,6 +8,7 @@
   "include": [
     "src/**/*.ts",
     "domain/**/*.ts",
+    "application/**/*.ts",
     "interfaces/**/*.ts",
     "adapters/**/*.ts",
     "middleware/**/*.ts",

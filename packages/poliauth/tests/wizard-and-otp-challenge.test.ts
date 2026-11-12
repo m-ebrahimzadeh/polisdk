@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { CredentialSetupWizard } from '../domain/credential-wizard.js';
-import { OtpChallengeCoordinator } from '../domain/otp-challenge.js';
+import { CredentialSetupWizard } from '../application/credential-wizard.js';
+import { OtpChallengeCoordinator } from '../application/otp-challenge.js';
 import { TotpService } from '../domain/totp.js';
 
 describe('CredentialSetupWizard & OtpChallengeCoordinator', () => {

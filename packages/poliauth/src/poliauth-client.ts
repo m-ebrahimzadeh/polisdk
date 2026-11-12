@@ -1,18 +1,18 @@
 import type { IdentityId, SavedVaultCredentials } from '../domain/entities.js';
 import { TotpService } from '../domain/totp.js';
-import { OtpChallengeCoordinator } from '../domain/otp-challenge.js';
-import { CredentialSetupWizard } from '../domain/credential-wizard.js';
+import { OtpChallengeCoordinator } from '../application/otp-challenge.js';
+import { CredentialSetupWizard } from '../application/credential-wizard.js';
 import {
   AuthorizationService,
   type AuthorizationServiceOptions
-} from '../domain/authorization.js';
+} from '../application/authorization.js';
 import {
   PoliAuthOrchestrator,
   type PolimiSessionAuthRequest,
   type PolimiSessionAuthOutcome,
   type FederatedSamlAuthRequest,
   type FederatedSamlAuthOutcome
-} from '../domain/login-orchestrator.js';
+} from '../application/login-orchestrator.js';
 import type {
   VaultStoragePort,
   UserVaultStorageFactoryPort,

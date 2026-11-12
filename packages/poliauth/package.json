@@ -15,6 +15,10 @@
       "types": "./dist/domain/index.d.ts",
       "import": "./dist/domain/index.js"
     },
+    "./application": {
+      "types": "./dist/application/index.d.ts",
+      "import": "./dist/application/index.js"
+    },
     "./interfaces": {
       "types": "./dist/interfaces/index.d.ts",
       "import": "./dist/interfaces/index.js"
@@ -35,6 +39,7 @@
   "files": [
     "dist",
     "domain",
+    "application",
     "interfaces",
     "adapters",
     "middleware",

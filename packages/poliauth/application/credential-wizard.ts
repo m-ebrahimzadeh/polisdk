@@ -1,18 +1,18 @@
 /**
- * @module @polisdk/poliauth/domain/credential-wizard
- * Platform-Agnostic Interactive Credential Onboarding Wizard State Machine.
+ * @module @polisdk/poliauth/application/credential-wizard
+ * Platform-Agnostic Interactive Credential Onboarding Wizard State Machine (Application Layer).
  */
 
 import {
   maskPersonCode,
   maskPolimiEmail
-} from './credentials.js';
+} from '../domain/credentials.js';
 import {
   normalizeIdentityId,
   type IdentityId,
   type SavedVaultCredentials
-} from './entities.js';
-import { cleanTotpSecret, isValidTotpSecret } from './totp.js';
+} from '../domain/entities.js';
+import { cleanTotpSecret, isValidTotpSecret } from '../domain/totp.js';
 
 export type WizardStep = 'person_code' | 'password' | 'email' | 'totp_secret';
 

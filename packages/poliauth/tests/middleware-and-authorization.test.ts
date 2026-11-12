@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { AuthorizationService } from '../domain/authorization.js';
+import { AuthorizationService } from '../application/authorization.js';
 import { createAuthMiddleware } from '../middleware/auth-middleware.js';
 import { redactSecrets, createRedactingLogger } from '../middleware/redaction.js';
 import { InMemoryUserIdentityRepository, InMemoryVaultStorage } from '../storage/memory-storage.js';

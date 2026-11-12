@@ -1,19 +1,19 @@
 /**
- * @module @polisdk/poliauth/domain/authorization
- * Access Control, Allowlist/Admin RBAC, and Pluggable Resource Authorization Service.
+ * @module @polisdk/poliauth/application/authorization
+ * Access Control, Allowlist/Admin RBAC, and Pluggable Resource Authorization Service (Application Layer).
  */
 
 import {
   normalizeIdentityId,
   type AuthSubject,
   type IdentityId
-} from './entities';
+} from '../domain/entities.js';
 import type {
   AuthorizationDecision,
   AuthorizationServicePort,
   ResourceAuthorizationPolicyPort,
   ResourceDescriptor
-} from '../interfaces/authorization-port';
+} from '../interfaces/authorization-port.js';
 
 export interface AuthorizationServiceOptions {
   /**
@@ -26,12 +26,12 @@ export interface AuthorizationServiceOptions {
    */
   adminUserIds?: Iterable<IdentityId>;
   /**
-   * Whether non-private channels (e.g. group chats) should be rejected by default.
+   * Whether non-private channels should be rejected by default.
    * Default: `true`.
    */
   enforcePrivateChannel?: boolean;
   /**
-   * Optional resource-level authorization policy (e.g. course or recording access check).
+   * Optional resource-level authorization policy.
    */
   resourcePolicy?: ResourceAuthorizationPolicyPort;
 }
@@ -92,7 +92,11 @@ export class AuthorizationService implements AuthorizationServicePort {
       };
     }
 
-    if (params.userId === undefined || params.userId === null || String(params.userId).trim() === '') {
+    if (
+      params.userId === undefined ||
+      params.userId === null ||
+      String(params.userId).trim() === ''
+    ) {
       return {
         allowed: false,
         reasonCode: 'UNAUTHENTICATED_SUBJECT',

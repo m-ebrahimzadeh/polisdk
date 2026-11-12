@@ -1,6 +1,6 @@
 /**
- * @module @polisdk/poliauth/domain/login-orchestrator
- * Unified, Driver-Agnostic Politecnico di Milano SSO & Federated SAML SSO Orchestrator.
+ * @module @polisdk/poliauth/application/login-orchestrator
+ * Unified, Driver-Agnostic Politecnico di Milano SSO & Federated SAML SSO Orchestrator (Application Layer).
  *
  * Authentication concludes once an authenticated PoliMi session is established,
  * completely decoupled from downstream service navigation.
@@ -10,8 +10,8 @@ import type {
   IdentityId,
   LoginCredentials,
   LoginFlowStatus
-} from './entities.js';
-import { POLIMI_LOGIN_FLOW_SPEC } from './login-flow-spec.js';
+} from '../domain/entities.js';
+import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
 import type { AuthPageDriverPort } from '../interfaces/browser-driver-port.js';
 import type {
   LoginProgressCallbacks,
@@ -94,7 +94,6 @@ export class PoliAuthOrchestrator {
     };
 
     try {
-      // Check if already in an authenticated PoliMi session
       const initialStage = await driver
         .inspectPolimiStage()
         .catch(() => ({ stage: 'unknown' as const, url: '', title: '' }));

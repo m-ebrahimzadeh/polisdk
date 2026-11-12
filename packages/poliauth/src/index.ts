@@ -1,4 +1,5 @@
 export * from '../domain/index.js';
+export * from '../application/index.js';
 export * from '../interfaces/index.js';
 export * from '../storage/index.js';
 export * from '../adapters/index.js';

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { PoliAuthOrchestrator } from '../domain/login-orchestrator.js';
-import { OtpChallengeCoordinator } from '../domain/otp-challenge.js';
+import { PoliAuthOrchestrator } from '../application/login-orchestrator.js';
+import { OtpChallengeCoordinator } from '../application/otp-challenge.js';
 import { TotpService } from '../domain/totp.js';
 import type {
   PolimiStageInspectionResult,
