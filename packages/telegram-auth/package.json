@@ -21,7 +21,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@polisdk/poliauth": "*"
+    "@polisdk/poliauth": "^2.0.0"
   },
   "devDependencies": {
     "typescript": "^5.7.3",

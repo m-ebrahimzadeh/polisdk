@@ -4,11 +4,45 @@
  * Zero-dependency implementation powered by standard Web Crypto API (`crypto.subtle`).
  */
 
-import type {
-  StableTotpOptions,
-  TotpGeneratorPort,
-  TotpOptions
-} from '../interfaces/crypto-port';
+export interface TotpOptions {
+  /** Timestamp in milliseconds. Defaults to Date.now(). */
+  timestampMs?: number;
+  /** Time step in seconds. Default 30. */
+  timeStepSeconds?: number;
+  /** Number of OTP digits. Default 6. */
+  digits?: number;
+}
+
+export interface StableTotpOptions extends TotpOptions {
+  /**
+   * Minimum remaining validity window in seconds before generating a code.
+   * If the current window has `<= minRemainingSeconds` left, `generateStable`
+   * waits for the next time step so the code never expires mid-request.
+   * Default: 2 seconds.
+   */
+  minRemainingSeconds?: number;
+}
+
+export interface StableTotpResult {
+  code: string;
+  remainingSeconds: number;
+  waitedMs: number;
+}
+
+/**
+ * Port/contract for RFC 6238 / RFC 4226 TOTP generation and Base32 validation.
+ */
+export interface TotpGeneratorPort {
+  cleanSecret(input: string): string;
+  isValidSecret(input: string): boolean;
+  decodeBase32(base32Str: string): Uint8Array;
+  generate(secret: string, options?: TotpOptions): Promise<string>;
+  generateStable(
+    secret: string,
+    options?: StableTotpOptions
+  ): Promise<StableTotpResult>;
+  getRemainingSeconds(timestampMs?: number, timeStepSeconds?: number): number;
+}
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const BASE32_LOOKUP: Record<string, number> = {};
@@ -228,5 +262,3 @@ export class TotpService implements TotpGeneratorPort {
     return getTotpRemainingSeconds(timestampMs, timeStepSeconds);
   }
 }
-
-export type { TotpOptions, StableTotpOptions };

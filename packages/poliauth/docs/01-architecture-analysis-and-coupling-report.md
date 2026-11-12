@@ -33,6 +33,8 @@ flowchart TD
     StoragePort["interfaces/storage-port.ts"]
     CryptoPort["interfaces/crypto-port.ts"]
     DriverPort["interfaces/browser-driver-port.ts"]
+    FederatedPort["interfaces/federated-sso-provider-port.ts"]
+    SessionPoolPort["interfaces/session-pool-port.ts"]
     OtpPort["interfaces/otp-provider-port.ts"]
     AuthzPort["interfaces/authorization-port.ts"]
     LoggerPort["interfaces/logger-port.ts"]
@@ -46,6 +48,8 @@ flowchart TD
   subgraph Adapters["Pure DOM Adapters (adapters/)"]
     PolimiDom["adapters/polimi-dom-adapter.ts"]
     WebexDom["adapters/webex-sso-dom-adapter.ts"]
+    FederatedDom["adapters/federated-sso-dom-adapter.ts"]
+    Registry["adapters/federated-sso-provider-registry.ts"]
     DomDriver["adapters/dom-page-driver.ts"]
   end
 
@@ -61,7 +65,7 @@ flowchart TD
   Client --> Middleware
   Application --> Domain
   Application --> Ports
-  Domain --> CryptoPort
+  Ports --> Domain
   Storage --> Domain
   Storage --> Ports
   Adapters --> Domain

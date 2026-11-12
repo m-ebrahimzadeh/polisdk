@@ -17,12 +17,12 @@
 | Import Path | Contents |
 |---|---|
 | `@polisdk/poliauth` | Unified `PoliAuth` facade + re-exports of all core layers |
-| `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`), `TotpService`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation utilities |
+| `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`), `TotpService`, `cleanTotpSecret`, `isValidTotpSecret`, `decodeTotpBase32`, `generateTotp`, `generateStableTotp`, `getTotpRemainingSeconds`, `TotpOptions`, `StableTotpOptions`, `StableTotpResult`, `TotpGeneratorPort`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation utilities (`normalizeCredentials`, `maskSecret`, `maskPersonCode`) |
 | `@polisdk/poliauth/application` | `PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService` |
-| `@polisdk/poliauth/interfaces` | `AuthPageDriverPort`, `SessionContextPoolPort`, `VaultStoragePort`, `UserVaultStorageFactoryPort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `OtpChallengeProviderPort`, `AuthorizationServicePort`, `AuthLoggerPort` |
+| `@polisdk/poliauth/interfaces` | Segregated role ports: `AuthPageDriverPort`, `PageNavigationPort`, `PolimiIdpPagePort`, `FederatedSsoPageDriverPort`, `FederatedAuthPageDriverPort`, `FederatedSsoProviderAdapterPort`, `FederatedSsoProviderResolverPort`, `FederatedSsoProviderSpec`, `VaultStoragePort`, `VaultSecretMaterialPort`, `UserVaultStorageFactoryPort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `UserIdentityProvisionerPort`, `UserIdentityReaderPort`, `UserIdentityWriterPort`, `SessionContextPoolPort`, `SessionContextLeasePort`, `SessionContextPersistencePort`, `SessionContextDisposalPort`, `SessionPoolStatsPort`, `OtpChallengeProviderPort`, `OtpCodeProviderPort`, `ManualOtpChallengePort`, `AuthorizationServicePort`, `AccessEvaluatorPort`, `SubjectRoleQueryPort`, `ResourceAuthorizerPort`, `ResourceAuthorizationPolicyPort`, `AuthLoggerPort`, `MaybePromise` |
 | `@polisdk/poliauth/storage` | `EncryptedCredentialVault`, `saveEncryptedCredentials`, `loadEncryptedCredentials`, `clearEncryptedCredentials`, `saveEncryptedSessionState`, `loadEncryptedSessionState`, `clearEncryptedSessionState`, `InMemoryVaultStorage`, `InMemoryUserVaultStorageFactory`, `InMemorySessionStateStore`, `InMemoryUserIdentityRepository` |
-| `@polisdk/poliauth/adapters` | `DomAuthPageDriver`, `polimi-dom-adapter`, `webex-sso-dom-adapter` |
-| `@polisdk/poliauth/middleware` | `createAuthMiddleware`, `redactSecrets`, `createRedactingLogger` |
+| `@polisdk/poliauth/adapters` | `DomAuthPageDriver`, `DomFederatedAuthPageDriver`, `polimi-dom-adapter`, `webex-sso-dom-adapter` (`WebexSamlProviderAdapter`, `WEBEX_SAML_FLOW_SPEC`), `federated-sso-dom-adapter` (`SelectorFederatedSsoProviderAdapter`, `inspectFederatedSsoPageBySpec`, `submitFederatedIdentifierBySpec`), `federated-sso-provider-registry` (`FederatedSsoProviderRegistry`, `createDefaultFederatedSsoProviderRegistry`) |
+| `@polisdk/poliauth/middleware` | `createAuthMiddleware`, `redactSecrets`, `redactSensitiveErrorText`, `createRedactingLogger` |
 
 ---
 
