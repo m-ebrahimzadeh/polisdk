@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
-import { PoliAuthOrchestrator } from '../application/login-orchestrator.js';
+import {
+  DEFAULT_POLIMI_SESSION_PROBE_URL,
+  PoliAuthOrchestrator
+} from '../application/login-orchestrator.js';
 import { OtpChallengeCoordinator } from '../application/otp-challenge.js';
 import { TotpService } from '../domain/totp.js';
 import {
@@ -2083,5 +2086,334 @@ describe('TASK-7.2: Per-User Singleflight Login Deduplication', () => {
     expect(explicitDriver.submittedCreds).toHaveLength(1);
     expect(explicitDriver.submittedOtps).toHaveLength(1);
     expect(acquireSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('TASK-7.3: Tier 1 Pre-Hydration Session Probing', () => {
+  it('short-circuits in milliseconds when pre-hydration probe detects an authenticated session without submitting credentials or OTP', async () => {
+    const orchestrator = new PoliAuthOrchestrator({
+      otpCoordinator: new OtpChallengeCoordinator({ totpGenerator: new TotpService() })
+    });
+
+    // 1. Explicit request.probeExistingSession = true probes servizionline.polimi.it/portaleservizi/ and hits
+    const hitDriver = new SimulatedPolimiPageDriver([
+      { stage: 'unknown', url: 'about:blank', title: '' },
+      {
+        stage: 'authenticated',
+        url: 'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do',
+        title: 'Portale servizi'
+      }
+    ]);
+    let onAuthenticatedCount = 0;
+    const hitStatuses: string[] = [];
+
+    const hitOutcome = await orchestrator.authenticate({
+      userId: 9301,
+      driver: hitDriver,
+      probeExistingSession: true,
+      pollDelayMs: 0,
+      credentials: {
+        personCode: '10987654',
+        password: 'MyPoliPassword!',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      },
+      callbacks: {
+        onStatusChange: (status) => {
+          hitStatuses.push(status);
+        }
+      },
+      onAuthenticated: () => {
+        onAuthenticatedCount += 1;
+      }
+    });
+
+    expect(DEFAULT_POLIMI_SESSION_PROBE_URL).toBe(
+      'https://servizionline.polimi.it/portaleservizi/'
+    );
+    expect(hitOutcome.ok).toBe(true);
+    expect(hitOutcome.status).toBe('authenticated');
+    expect(hitOutcome.stage).toBe('authenticated');
+    expect(hitOutcome.sessionReused).toBe(true);
+    expect(hitOutcome.preHydrationProbeHit).toBe(true);
+    expect(hitOutcome.url).toBe(
+      'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do'
+    );
+    expect(hitDriver.navigatedUrls).toEqual([
+      'https://servizionline.polimi.it/portaleservizi/'
+    ]);
+    expect(hitDriver.navigatedUrls).not.toContain(
+      'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376'
+    );
+    expect(hitDriver.submittedCreds).toHaveLength(0);
+    expect(hitDriver.submittedOtps).toHaveLength(0);
+    expect(onAuthenticatedCount).toBe(1);
+    expect(hitStatuses).toContain('authenticated');
+
+    // 2. Case 1: already-open authenticated tab short-circuits with zero goto() calls
+    const alreadyOpenDriver = new SimulatedPolimiPageDriver([
+      {
+        stage: 'authenticated',
+        url: 'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do',
+        title: 'Portale servizi'
+      }
+    ]);
+    const alreadyOpenOutcome = await orchestrator.authenticate({
+      userId: 9302,
+      driver: alreadyOpenDriver,
+      pollDelayMs: 0,
+      credentials: { personCode: '10987654', password: 'MyPoliPassword!' }
+    });
+    expect(alreadyOpenOutcome.ok).toBe(true);
+    expect(alreadyOpenOutcome.status).toBe('authenticated');
+    expect(alreadyOpenOutcome.stage).toBe('authenticated');
+    expect(alreadyOpenOutcome.sessionReused).toBe(true);
+    expect(alreadyOpenDriver.navigatedUrls).toHaveLength(0);
+    expect(alreadyOpenDriver.submittedCreds).toHaveLength(0);
+    expect(alreadyOpenDriver.submittedOtps).toHaveLength(0);
+
+    // 3. Constructor & execution options + PoliAuth pooled login automatic probe on restored session state
+    const users = new InMemoryUserIdentityRepository();
+    const { pool, acquireSpy, saveStateSpy, releaseSpy } = createTrackingSessionPool();
+    const restoredDrivers: SimulatedPolimiPageDriver[] = [];
+    const customAcquire = pool.acquireUserContext.bind(pool);
+    pool.acquireUserContext = async (uid) => {
+      const managed = await customAcquire(uid);
+      (managed as ManagedSessionContext<{ id: string }, { pageId: number }> & {
+        hasRestoredSessionState?: boolean;
+      }).hasRestoredSessionState = true;
+      return managed;
+    };
+
+    const pooledClient = new PoliAuth({
+      userStorageFactory: new InMemoryUserVaultStorageFactory(),
+      identityRepository: users,
+      sessionPool: pool,
+      driverFactory: () => {
+        const driver = new SimulatedPolimiPageDriver([
+          { stage: 'unknown', url: 'about:blank', title: '' },
+          {
+            stage: 'authenticated',
+            url: 'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do',
+            title: 'Portale servizi'
+          }
+        ]);
+        restoredDrivers.push(driver);
+        return driver;
+      }
+    });
+    await pooledClient.saveCredentials(
+      {
+        personCode: '10993001',
+        password: 'PooledSecretPassword!',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      },
+      9303
+    );
+
+    const pooledOutcome = await pooledClient.authenticate({
+      userId: 9303,
+      pollDelayMs: 0
+    });
+    expect(pooledOutcome.ok).toBe(true);
+    expect(pooledOutcome.status).toBe('authenticated');
+    expect(pooledOutcome.stage).toBe('authenticated');
+    expect(pooledOutcome.sessionReused).toBe(true);
+    expect(acquireSpy).toHaveBeenCalledTimes(1);
+    expect(saveStateSpy).toHaveBeenCalledTimes(1);
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+    expect(restoredDrivers).toHaveLength(1);
+    expect(restoredDrivers[0]!.navigatedUrls).toEqual([
+      'https://servizionline.polimi.it/portaleservizi/'
+    ]);
+    expect(restoredDrivers[0]!.submittedCreds).toHaveLength(0);
+    expect(restoredDrivers[0]!.submittedOtps).toHaveLength(0);
+
+    // 4. Circuit breaker reauth_required still fast-fails BEFORE any pre-hydration probe navigation
+    await users.updateLoginStatus(9303, 'reauth_required', 'Password expired');
+    acquireSpy.mockClear();
+    const blockedOutcome = await pooledClient.authenticate(
+      { userId: 9303, probeExistingSession: true, pollDelayMs: 0 },
+      { enablePreHydrationSessionProbe: true }
+    );
+    expect(blockedOutcome.ok).toBe(false);
+    expect(blockedOutcome.status).toBe('reauth_required');
+    expect(acquireSpy).not.toHaveBeenCalled();
+  });
+
+  it('transitions seamlessly into full serviceEntryUrl login when pre-hydration session probe misses (session_expired or credentials)', async () => {
+    const logs: Array<{ level: string; message: string }> = [];
+    const logger: AuthLoggerPort = {
+      debug: (msg) => logs.push({ level: 'debug', message: msg }),
+      info: (msg) => logs.push({ level: 'info', message: msg }),
+      warn: (msg) => logs.push({ level: 'warn', message: msg }),
+      error: (msg) => logs.push({ level: 'error', message: msg })
+    };
+
+    const orchestrator = new PoliAuthOrchestrator({
+      otpCoordinator: new OtpChallengeCoordinator({ totpGenerator: new TotpService() }),
+      logger
+    });
+
+    // 1. Stale cookies redirect probe to session_expired -> seamless full login flow
+    const missDriver = new SimulatedPolimiPageDriver([
+      { stage: 'unknown', url: 'about:blank', title: '' },
+      {
+        stage: 'session_expired',
+        url: 'https://aunicalogin.polimi.it/aunicalogin/controller/logout/SessioneTerminata.do',
+        title: 'Sessione di lavoro scaduta'
+      },
+      {
+        stage: 'credentials',
+        url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp?id_servizio=376',
+        title: 'Autenticazione'
+      },
+      {
+        stage: 'otp',
+        url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do',
+        title: 'Autenticazione 2FA'
+      },
+      {
+        stage: 'authenticated',
+        url: 'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do',
+        title: 'Portale servizi'
+      }
+    ]);
+
+    const missOutcome = await orchestrator.authenticate({
+      userId: 9311,
+      driver: missDriver,
+      probeExistingSession: true,
+      pollDelayMs: 0,
+      credentials: {
+        personCode: '10987654',
+        password: 'MyPoliPassword!',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      }
+    });
+
+    expect(missOutcome.ok).toBe(true);
+    expect(missOutcome.status).toBe('authenticated');
+    expect(missOutcome.stage).toBe('authenticated');
+    expect(missOutcome.sessionReused).toBe(false);
+    expect(missOutcome.preHydrationProbeHit).toBe(false);
+    expect(missDriver.navigatedUrls).toEqual([
+      'https://servizionline.polimi.it/portaleservizi/',
+      'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376'
+    ]);
+    expect(missDriver.submittedCreds).toHaveLength(1);
+    expect(missDriver.submittedOtps).toHaveLength(1);
+    expect(logs.length).toBeGreaterThan(0);
+    const serializedMissLogs = logs.map((entry) => entry.message).join('\n');
+    expect(serializedMissLogs).not.toContain('MyPoliPassword!');
+    expect(serializedMissLogs).not.toContain('JBSWY3DPEHPK3PXP');
+
+    // 2. Pooled login with stale restored state falls back to full login; explicit probeExistingSession: false bypasses probe
+    const users = new InMemoryUserIdentityRepository();
+    const { pool } = createTrackingSessionPool();
+    const baseAcquire = pool.acquireUserContext.bind(pool);
+    pool.acquireUserContext = async (uid) => {
+      const managed = await baseAcquire(uid);
+      (managed as ManagedSessionContext<{ id: string }, { pageId: number }> & {
+        hasRestoredSessionState?: boolean;
+      }).hasRestoredSessionState = true;
+      return managed;
+    };
+
+    const stalePooledDrivers: SimulatedPolimiPageDriver[] = [];
+    const client = new PoliAuth({
+      userStorageFactory: new InMemoryUserVaultStorageFactory(),
+      identityRepository: users,
+      sessionPool: pool,
+      sessionProbeUrl: 'https://servizionline.polimi.it/portaleservizi/?probe=1',
+      driverFactory: () => {
+        const drv = new SimulatedPolimiPageDriver([
+          { stage: 'unknown', url: 'about:blank', title: '' },
+          {
+            stage: 'credentials',
+            url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp',
+            title: 'Autenticazione'
+          },
+          {
+            stage: 'credentials',
+            url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp?id_servizio=376',
+            title: 'Autenticazione'
+          },
+          {
+            stage: 'otp',
+            url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do',
+            title: 'Autenticazione 2FA'
+          },
+          {
+            stage: 'authenticated',
+            url: 'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do',
+            title: 'Portale servizi'
+          }
+        ]);
+        stalePooledDrivers.push(drv);
+        return drv;
+      }
+    });
+    await client.saveCredentials(
+      {
+        personCode: '10993012',
+        password: 'PooledSecretPassword!',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      },
+      9312
+    );
+
+    const staleOutcome = await client.authenticate({
+      userId: 9312,
+      pollDelayMs: 0
+    });
+    expect(staleOutcome.ok).toBe(true);
+    expect(staleOutcome.sessionReused).toBe(false);
+    expect(stalePooledDrivers[0]!.navigatedUrls).toEqual([
+      'https://servizionline.polimi.it/portaleservizi/?probe=1',
+      'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376'
+    ]);
+    expect(stalePooledDrivers[0]!.submittedCreds).toHaveLength(1);
+    expect(stalePooledDrivers[0]!.submittedOtps).toHaveLength(1);
+
+    // Explicit opt-out skips probe even when managedContext reports restored state
+    const skipProbeClient = new PoliAuth({
+      userStorageFactory: new InMemoryUserVaultStorageFactory(),
+      identityRepository: users,
+      sessionPool: pool,
+      driverFactory: () => {
+        const drv = new SimulatedPolimiPageDriver([
+          { stage: 'unknown', url: 'about:blank', title: '' },
+          {
+            stage: 'credentials',
+            url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp?id_servizio=376',
+            title: 'Autenticazione'
+          },
+          {
+            stage: 'authenticated',
+            url: 'https://servizionline.polimi.it/portaleservizi/portaleservizi/controller/Portale.do',
+            title: 'Portale servizi'
+          }
+        ]);
+        stalePooledDrivers.push(drv);
+        return drv;
+      }
+    });
+    await skipProbeClient.saveCredentials(
+      {
+        personCode: '10993013',
+        password: 'PooledSecretPassword!'
+      },
+      9313
+    );
+    const noProbeOutcome = await skipProbeClient.authenticate({
+      userId: 9313,
+      probeExistingSession: false,
+      pollDelayMs: 0
+    });
+    expect(noProbeOutcome.ok).toBe(true);
+    expect(noProbeOutcome.sessionReused).toBe(false);
+    expect(stalePooledDrivers[1]!.navigatedUrls).toEqual([
+      'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376'
+    ]);
   });
 });

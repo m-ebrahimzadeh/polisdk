@@ -4,7 +4,7 @@ import {
   type PoliAuthFailureClassification,
   type SavedVaultCredentials
 } from '../domain/entities.js';
-import { redactSecrets } from '../domain/redaction.js';
+import { redactSecrets, redactSensitiveErrorText } from '../domain/redaction.js';
 import { TotpService } from '../domain/totp.js';
 import { OtpChallengeCoordinator } from '../application/otp-challenge.js';
 import { CredentialSetupWizard } from '../application/credential-wizard.js';
@@ -135,6 +135,17 @@ export interface PoliAuthConfig<TContext = unknown, TPage = unknown> {
    */
   enableSingleflight?: boolean;
   /**
+   * Probe existing/restored sessions via `sessionProbeUrl` before initiating full
+   * multi-stage IdP login. Pool-managed calls automatically probe whenever a restored
+   * `storageState` / session is detected unless explicitly set to `false`.
+   */
+  enablePreHydrationSessionProbe?: boolean;
+  /**
+   * Optional custom Tier 1 session probe URL.
+   * Defaults to `DEFAULT_POLIMI_SESSION_PROBE_URL`.
+   */
+  sessionProbeUrl?: string;
+  /**
    * Optional RBAC & allowlist configuration.
    */
   authorizationOptions?: AuthorizationServiceOptions;
@@ -159,6 +170,46 @@ type PreBrowserCredentialsResult<TCreds> =
   | { ok: true; credentials: TCreds }
   | { ok: false; outcome: PreBrowserFailureOutcome };
 
+async function hasManagedRestoredSessionState<TContext, TPage>(
+  managed: ManagedSessionContext<TContext, TPage>,
+  logger?: AuthLoggerPort
+): Promise<boolean> {
+  const candidate = managed as ManagedSessionContext<TContext, TPage> & {
+    hasRestoredSessionState?: unknown;
+  };
+  if (typeof candidate.hasRestoredSessionState === 'boolean') {
+    return candidate.hasRestoredSessionState;
+  }
+  const ctx = managed.context as
+    | {
+        restoredState?: unknown;
+        storageState?: () => Promise<unknown>;
+      }
+    | null
+    | undefined;
+  if (ctx?.restoredState && typeof ctx.restoredState === 'object') {
+    const cookies = (ctx.restoredState as { cookies?: unknown }).cookies;
+    return Array.isArray(cookies) ? cookies.length > 0 : true;
+  }
+  if (typeof ctx?.storageState === 'function') {
+    try {
+      const state = await ctx.storageState();
+      if (state && typeof state === 'object') {
+        const cookies = (state as { cookies?: unknown }).cookies;
+        if (Array.isArray(cookies)) {
+          return cookies.length > 0;
+        }
+      }
+    } catch (err) {
+      logger?.debug(
+        'Unable to inspect BrowserContext storageState during pre-hydration check.',
+        redactSensitiveErrorText(err)
+      );
+    }
+  }
+  return false;
+}
+
 export class PoliAuth<TContext = unknown, TPage = unknown> {
   public readonly vault: EncryptedCredentialVault;
   public readonly totp: TotpService;
@@ -171,6 +222,8 @@ export class PoliAuth<TContext = unknown, TPage = unknown> {
   public readonly logger?: AuthLoggerPort;
   private readonly driverFactory?: PoliAuthDriverFactory<TContext, TPage>;
   private readonly enableSingleflight: boolean;
+  private readonly enablePreHydrationSessionProbe?: boolean;
+  private readonly sessionProbeUrl?: string;
   private readonly facadeInFlightAuth = new Map<string, Promise<PolimiSessionAuthOutcome>>();
   private readonly facadeInFlightFederatedAuth = new Map<
     string,
@@ -185,6 +238,8 @@ export class PoliAuth<TContext = unknown, TPage = unknown> {
     this.hasUserFactory = Boolean(config.userStorageFactory);
     this.hasExplicitUserRepository = Boolean(configuredUsers);
     this.enableSingleflight = config.enableSingleflight ?? true;
+    this.enablePreHydrationSessionProbe = config.enablePreHydrationSessionProbe;
+    this.sessionProbeUrl = config.sessionProbeUrl;
     this.driverFactory = config.driverFactory ?? config.createPageDriver;
     this.totp = new TotpService();
     this.otpChallenge = new OtpChallengeCoordinator({ totpGenerator: this.totp });
@@ -197,7 +252,13 @@ export class PoliAuth<TContext = unknown, TPage = unknown> {
       otpCoordinator: this.otpChallenge,
       logger: this.logger,
       identityRepository: this.users,
-      enableSingleflight: this.enableSingleflight
+      enableSingleflight: this.enableSingleflight,
+      ...(config.enablePreHydrationSessionProbe !== undefined
+        ? { enablePreHydrationSessionProbe: config.enablePreHydrationSessionProbe }
+        : {}),
+      ...(config.sessionProbeUrl !== undefined
+        ? { sessionProbeUrl: config.sessionProbeUrl }
+        : {})
     });
     this.authorization = new AuthorizationService(config.authorizationOptions);
     this.sessionPool = config.sessionPool;
@@ -383,7 +444,8 @@ export class PoliAuth<TContext = unknown, TPage = unknown> {
     options?: PoliAuthExecutionOptions;
     runWithDriver: (
       driver: AuthPageDriverPort | FederatedAuthPageDriverPort,
-      resolvedCredentials: TCreds
+      resolvedCredentials: TCreds,
+      managed: ManagedSessionContext<TContext, TPage>
     ) => Promise<TOutcome>;
   }): Promise<TOutcome> {
     const { pool, driverFactory } = this.assertPoolPrerequisites(
@@ -417,7 +479,7 @@ export class PoliAuth<TContext = unknown, TPage = unknown> {
         try {
           const page = await pool.getOrCreatePrimaryPage(managed);
           const driver = await driverFactory(page, managed);
-          const outcome = await params.runWithDriver(driver, preflight.credentials);
+          const outcome = await params.runWithDriver(driver, preflight.credentials, managed);
           if (outcome.ok) {
             await pool.saveUserContextState(params.userId);
           }
@@ -491,15 +553,26 @@ export class PoliAuth<TContext = unknown, TPage = unknown> {
       registry: this.facadeInFlightAuth,
       singleflightKey: key,
       options,
-      runWithDriver: (driver, credentials) =>
-        this.orchestrator.authenticate(
+      runWithDriver: async (driver, credentials, managed) => {
+        const hasRestoredSession = await hasManagedRestoredSessionState(managed, this.logger);
+        const probeExistingSession =
+          request.probeExistingSession ??
+          options?.enablePreHydrationSessionProbe ??
+          this.enablePreHydrationSessionProbe ??
+          hasRestoredSession;
+        const resolvedProbeUrl =
+          request.sessionProbeUrl ?? options?.sessionProbeUrl ?? this.sessionProbeUrl;
+        return this.orchestrator.authenticate(
           {
             ...request,
             credentials,
-            driver
+            driver,
+            probeExistingSession,
+            ...(resolvedProbeUrl !== undefined ? { sessionProbeUrl: resolvedProbeUrl } : {})
           },
           options
-        )
+        );
+      }
     });
   }
 

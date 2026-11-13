@@ -1,15 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import type { AuthLoggerPort, FederatedSsoProviderSpec } from '@polisdk/poliauth/interfaces';
 import { InMemorySessionStateStore } from '@polisdk/poliauth/storage';
 import {
-  getInjectedAuthAdapterBundleCode,
+  DEFAULT_FAST_PATH_BLOCKED_RESOURCE_TYPES,
+  DEFAULT_FAST_PATH_BLOCKED_TRACKER_DOMAINS,
   ensureAuthAdaptersInjected,
+  ensureFastPathResourceBlockingInstalled,
+  getInjectedAuthAdapterBundleCode,
   PlaywrightAuthPageDriver,
   PlaywrightBrowserSessionPool,
+  shouldBlockFastPathRequest,
   type PlaywrightBrowserLike,
   type PlaywrightContextLike,
-  type PlaywrightPageLike
+  type PlaywrightPageLike,
+  type PlaywrightRequestLike,
+  type PlaywrightRouteLike
 } from '../src/index.js';
 
 function createJsdomPage(dom: JSDOM): PlaywrightPageLike {
@@ -335,6 +341,344 @@ describe('@polisdk/poliauth-playwright — Driver, Bundle Injection & Session Po
 
       await pool.destroyUserContext(1, { clearPersistedState: true });
       expect(await sessionStore.loadSessionState(1)).toBeNull();
+    } finally {
+      await pool.closeAll();
+    }
+  });
+});
+
+describe('TASK-7.3: Tier 2 Playwright Fast-Path Resource Blocker & Restored State Tracking', () => {
+  type RouteHandler = (route: PlaywrightRouteLike, request: PlaywrightRequestLike) => Promise<void> | void;
+
+  function createFastPathMockPage(initialUrl = 'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376') {
+    const events: string[] = [];
+    const handlers: RouteHandler[] = [];
+    let currentUrl = initialUrl;
+
+    const routeMock = vi.fn(async (_pattern: string, handler: RouteHandler) => {
+      events.push('route');
+      handlers.push(handler);
+    });
+
+    const gotoMock = vi.fn(async (url: string) => {
+      events.push(`goto:${url}`);
+      currentUrl = url;
+      return null;
+    });
+
+    const page = {
+      url: () => currentUrl,
+      title: vi.fn(async () => 'PoliMI Login'),
+      goto: gotoMock,
+      waitForLoadState: vi.fn(async () => {}),
+      waitForSelector: vi.fn(async () => null),
+      waitForFunction: vi.fn(async () => undefined),
+      click: vi.fn(async () => {}),
+      fill: vi.fn(async () => {}),
+      type: vi.fn(async () => {}),
+      press: vi.fn(async () => {}),
+      evaluate: vi.fn(async () => undefined),
+      content: vi.fn(async () => '<html></html>'),
+      locator: vi.fn(() => ({
+        first: () => ({
+          count: vi.fn(async () => 0),
+          isVisible: vi.fn(async () => false),
+          textContent: vi.fn(async () => null),
+        }),
+      })),
+      route: routeMock,
+    };
+
+    return {
+      page,
+      events,
+      handlers,
+      routeMock,
+      gotoMock,
+      async dispatch(req: { url: string; resourceType?: string; method?: string }) {
+        const handler = handlers[0];
+        if (!handler) {
+          throw new Error('Expected route handler to be registered');
+        }
+        const abort = vi.fn(async () => {});
+        const continueFn = vi.fn(async () => {});
+        const route: PlaywrightRouteLike = {
+          abort,
+          continue: continueFn,
+          request: () => ({
+            url: () => req.url,
+            resourceType: () => req.resourceType ?? 'other',
+            method: () => req.method ?? 'GET',
+          }),
+        };
+        const request: PlaywrightRequestLike = {
+          url: () => req.url,
+          resourceType: () => req.resourceType ?? 'other',
+          method: () => req.method ?? 'GET',
+        };
+        await handler(route, request);
+        return { abort, continue: continueFn };
+      },
+    };
+  }
+
+  it('evaluates shouldBlockFastPathRequest safely and guarantees WeakSet idempotency', async () => {
+    expect(DEFAULT_FAST_PATH_BLOCKED_RESOURCE_TYPES).toEqual(['image', 'font', 'media']);
+    expect(DEFAULT_FAST_PATH_BLOCKED_TRACKER_DOMAINS).toContain('google-analytics.com');
+
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://servizionline.polimi.it/assets/logo.png',
+        resourceType: 'image',
+        method: 'GET',
+      }),
+    ).toBe(true);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://servizionline.polimi.it/assets/font.woff2',
+        resourceType: 'font',
+      }),
+    ).toBe(true);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://servizionline.polimi.it/assets/intro.mp4',
+        resourceType: 'media',
+      }),
+    ).toBe(true);
+
+    // Critical functional requests and default stylesheets stay allowed.
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://servizionline.polimi.it/portaleservizi/',
+        resourceType: 'document',
+        method: 'GET',
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://aunicalogin.polimi.it/aunicalogin/login.js',
+        resourceType: 'script',
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://aunicalogin.polimi.it/aunicalogin/api/session',
+        resourceType: 'xhr',
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://aunicalogin.polimi.it/aunicalogin/submit',
+        resourceType: 'document',
+        method: 'POST',
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://servizionline.polimi.it/app.css',
+        resourceType: 'stylesheet',
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockFastPathRequest(
+        {
+          url: 'https://servizionline.polimi.it/app.css',
+          resourceType: 'stylesheet',
+        },
+        { blockStylesheets: true },
+      ),
+    ).toBe(true);
+
+    // Trackers (including tracker scripts / beacons) and custom overrides are blocked.
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://www.google-analytics.com/analytics.js',
+        resourceType: 'script',
+      }),
+    ).toBe(true);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://www.googletagmanager.com/gtm.js?id=GTM-123',
+        resourceType: 'script',
+      }),
+    ).toBe(true);
+    expect(
+      shouldBlockFastPathRequest({
+        url: 'https://www.clarity.ms/collect',
+        resourceType: 'fetch',
+        method: 'POST',
+      }),
+    ).toBe(true);
+    expect(
+      shouldBlockFastPathRequest(
+        {
+          url: 'https://cdn.example-tracker.test/pixel',
+          resourceType: 'xhr',
+        },
+        { additionalBlockedDomainSubstrings: ['example-tracker.test'] },
+      ),
+    ).toBe(true);
+    expect(
+      shouldBlockFastPathRequest(
+        {
+          url: 'https://servizionline.polimi.it/favicon.ico',
+          resourceType: 'other',
+        },
+        { additionalBlockedResourceTypes: ['other'] },
+      ),
+    ).toBe(true);
+
+    const mock = createFastPathMockPage();
+    expect(await ensureFastPathResourceBlockingInstalled({} as unknown as Parameters<typeof ensureFastPathResourceBlockingInstalled>[0])).toBe(false);
+    expect(
+      await ensureFastPathResourceBlockingInstalled(
+        mock.page as unknown as Parameters<typeof ensureFastPathResourceBlockingInstalled>[0],
+        { enableFastPathResourceBlocking: false },
+      ),
+    ).toBe(false);
+    expect(mock.routeMock).not.toHaveBeenCalled();
+
+    const first = await ensureFastPathResourceBlockingInstalled(
+      mock.page as unknown as Parameters<typeof ensureFastPathResourceBlockingInstalled>[0],
+    );
+    const second = await ensureFastPathResourceBlockingInstalled(
+      mock.page as unknown as Parameters<typeof ensureFastPathResourceBlockingInstalled>[0],
+    );
+    expect(first).toBe(true);
+    expect(second).toBe(true);
+    expect(mock.routeMock).toHaveBeenCalledTimes(1);
+    expect(mock.routeMock).toHaveBeenCalledWith('**/*', expect.any(Function));
+
+    const blockedRes = await mock.dispatch({
+      url: 'https://servizionline.polimi.it/banner.png',
+      resourceType: 'image',
+    });
+    expect(blockedRes.abort).toHaveBeenCalledTimes(1);
+    expect(blockedRes.continue).not.toHaveBeenCalled();
+
+    const allowedRes = await mock.dispatch({
+      url: 'https://aunicalogin.polimi.it/aunicalogin/form',
+      resourceType: 'document',
+      method: 'POST',
+    });
+    expect(allowedRes.continue).toHaveBeenCalledTimes(1);
+    expect(allowedRes.abort).not.toHaveBeenCalled();
+  });
+
+  it('registers route blocker before goto() once per page on PlaywrightAuthPageDriver', async () => {
+    const mock = createFastPathMockPage();
+    const driver = new PlaywrightAuthPageDriver(
+      mock.page as unknown as ConstructorParameters<typeof PlaywrightAuthPageDriver>[0],
+      {
+        enableFastPathResourceBlocking: true,
+        fastPathResourceBlockerOptions: {
+          additionalBlockedResourceTypes: ['manifest'],
+          additionalBlockedDomainSubstrings: ['analytics.vendor.test'],
+        },
+      },
+    );
+
+    await driver.goto('https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376');
+    await driver.goto('https://servizionline.polimi.it/portaleservizi/');
+
+    expect(mock.routeMock).toHaveBeenCalledTimes(1);
+    expect(mock.events[0]).toBe('route');
+    expect(mock.events[1]).toMatch(/^goto:/);
+    expect(mock.gotoMock).toHaveBeenCalledTimes(2);
+
+    for (const req of [
+      { url: 'https://servizionline.polimi.it/img.webp', resourceType: 'image' },
+      { url: 'https://servizionline.polimi.it/roboto.woff2', resourceType: 'font' },
+      { url: 'https://servizionline.polimi.it/video.webm', resourceType: 'media' },
+      { url: 'https://www.google-analytics.com/analytics.js', resourceType: 'script' },
+      { url: 'https://www.googletagmanager.com/gtm.js', resourceType: 'script' },
+      { url: 'https://c.clarity.ms/collect', resourceType: 'fetch', method: 'POST' },
+      { url: 'https://servizionline.polimi.it/app.webmanifest', resourceType: 'manifest' },
+      { url: 'https://analytics.vendor.test/sdk.js', resourceType: 'script' },
+    ]) {
+      const outcome = await mock.dispatch(req);
+      expect(outcome.abort).toHaveBeenCalledTimes(1);
+      expect(outcome.continue).not.toHaveBeenCalled();
+    }
+
+    for (const req of [
+      { url: 'https://servizionline.polimi.it/portaleservizi/', resourceType: 'document', method: 'GET' },
+      { url: 'https://aunicalogin.polimi.it/login.js', resourceType: 'script', method: 'GET' },
+      { url: 'https://aunicalogin.polimi.it/api/me', resourceType: 'xhr', method: 'GET' },
+      { url: 'https://aunicalogin.polimi.it/api/otp', resourceType: 'fetch', method: 'POST' },
+      { url: 'https://aunicalogin.polimi.it/idp/Authn', resourceType: 'document', method: 'POST' },
+      { url: 'https://servizionline.polimi.it/styles.css', resourceType: 'stylesheet', method: 'GET' },
+    ]) {
+      const outcome = await mock.dispatch(req);
+      expect(outcome.continue).toHaveBeenCalledTimes(1);
+      expect(outcome.abort).not.toHaveBeenCalled();
+    }
+  });
+
+  it('installs blocker once per page on PlaywrightBrowserSessionPool and tracks hasRestoredSessionState', async () => {
+    const sessionStore = new InMemorySessionStateStore();
+    await sessionStore.saveSessionState(2, {
+      cookies: [{ name: 'JSESSIONID', value: 'restored-token', domain: 'servizionline.polimi.it', path: '/' }],
+      origins: [],
+    });
+
+    const pagesByUser = new Map<string, ReturnType<typeof createFastPathMockPage>>();
+    const capturedStorageStates: unknown[] = [];
+
+    const pool = new PlaywrightBrowserSessionPool({
+      sessionStateStore: sessionStore,
+      enableFastPathResourceBlocking: true,
+      fastPathResourceBlockerOptions: { blockStylesheets: true },
+      browserLauncher: async () => ({
+        newContext: async (options?: { storageState?: unknown }) => {
+          capturedStorageStates.push(options?.storageState ?? null);
+          const key = options?.storageState ? 'restored' : 'fresh';
+          const mockPage = createFastPathMockPage();
+          pagesByUser.set(key, mockPage);
+          const pages = [mockPage.page as unknown as PlaywrightPageLike];
+          return {
+            pages: () => pages,
+            newPage: async () => mockPage.page as unknown as PlaywrightPageLike,
+            addInitScript: vi.fn(async () => {}),
+            storageState: async () => ({
+              cookies: [{ name: 'SESSION', value: key, domain: 'servizionline.polimi.it', path: '/' }],
+              origins: [],
+            }),
+            close: async () => {},
+          };
+        },
+        close: async () => {},
+      }),
+    });
+
+    try {
+      // User 1 has no persisted state -> fresh context
+      const freshManaged = await pool.acquireUserContext(1);
+      expect(freshManaged.hasRestoredSessionState).toBe(false);
+      await pool.getOrCreatePrimaryPage(freshManaged);
+      await pool.getOrCreatePrimaryPage(freshManaged);
+      const freshPage = pagesByUser.get('fresh');
+      expect(freshPage).toBeDefined();
+      expect(freshPage?.routeMock).toHaveBeenCalledTimes(1);
+
+      // Verify blockStylesheets: true actually aborts stylesheets via pool blocker
+      const cssOutcome = await freshPage!.dispatch({
+        url: 'https://servizionline.polimi.it/theme.css',
+        resourceType: 'stylesheet',
+      });
+      expect(cssOutcome.abort).toHaveBeenCalledTimes(1);
+
+      // User 2 has persisted state -> restored context
+      const restoredManaged = await pool.acquireUserContext(2);
+      expect(restoredManaged.hasRestoredSessionState).toBe(true);
+      expect(capturedStorageStates[1]).toBeTruthy();
+      const restoredPage = pagesByUser.get('restored');
+      expect(restoredPage).toBeDefined();
+      expect(restoredPage?.routeMock).toHaveBeenCalledTimes(1);
+
+      // Persisting state for User 1 marks hasRestoredSessionState as true on active entry
+      await pool.saveUserContextState(1);
+      expect(freshManaged.hasRestoredSessionState).toBe(true);
     } finally {
       await pool.closeAll();
     }

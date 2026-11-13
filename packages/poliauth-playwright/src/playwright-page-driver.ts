@@ -20,6 +20,24 @@ import { createRedactingLogger, redactSensitiveErrorText } from '@polisdk/poliau
 import { ensureAuthAdaptersInjected, type EvaluatablePageLike } from './injected-auth-bundle.js';
 
 /**
+ * Structural interface matching a Playwright `Request` object.
+ */
+export interface PlaywrightRequestLike {
+  url(): string;
+  resourceType?(): string;
+  method?(): string;
+}
+
+/**
+ * Structural interface matching a Playwright `Route` object.
+ */
+export interface PlaywrightRouteLike {
+  request?(): PlaywrightRequestLike;
+  abort(errorCode?: string): Promise<void> | void;
+  continue(): Promise<void> | void;
+}
+
+/**
  * Structural interface matching a Playwright `Page` object.
  */
 export interface PlaywrightPageLike extends EvaluatablePageLike {
@@ -44,6 +62,186 @@ export interface PlaywrightPageLike extends EvaluatablePageLike {
   ): Promise<void>;
   waitForTimeout?(timeout: number): Promise<void>;
   isClosed?(): boolean;
+  route?(
+    url: string,
+    handler: (
+      route: PlaywrightRouteLike,
+      request?: PlaywrightRequestLike
+    ) => Promise<void> | void
+  ): Promise<void> | void;
+}
+
+/**
+ * Configuration options for Tier 2 Playwright fast-path asset blocking (`Spec Sec 7.2`).
+ */
+export interface FastPathResourceBlockerOptions {
+  readonly enableFastPathResourceBlocking?: boolean;
+  readonly blockStylesheets?: boolean;
+  readonly additionalBlockedResourceTypes?: readonly string[];
+  readonly additionalBlockedDomainSubstrings?: readonly string[];
+}
+
+export const DEFAULT_FAST_PATH_BLOCKED_RESOURCE_TYPES = [
+  'image',
+  'font',
+  'media'
+] as const;
+
+export const DEFAULT_FAST_PATH_BLOCKED_TRACKER_DOMAINS = [
+  'google-analytics.com',
+  'googletagmanager.com',
+  'doubleclick.net',
+  'hotjar.com',
+  'clarity.ms',
+  'connect.facebook.net'
+] as const;
+
+const fastPathBlockedPages = new WeakSet<object>();
+
+function extractHostnameSafe(rawUrl: string): string {
+  if (!rawUrl) return '';
+  try {
+    return new URL(rawUrl).hostname.toLowerCase();
+  } catch {
+    const match = /^[a-z]+:\/\/([^/?#:]+)/i.exec(rawUrl);
+    return (match?.[1] ?? '').toLowerCase();
+  }
+}
+
+/**
+ * Evaluates whether a Playwright network request should be aborted under the Tier 2
+ * fast-path asset blocker (`Spec Sec 7.2`).
+ *
+ * Strictly preserves `document`, `script` (first-party JAF/IdP JS), `xhr`, `fetch`,
+ * and non-tracker `POST` form submissions, as well as `stylesheet` requests unless
+ * `blockStylesheets: true`.
+ */
+export function shouldBlockFastPathRequest(
+  input: { url: string; resourceType?: string; method?: string },
+  options?: FastPathResourceBlockerOptions
+): boolean {
+  if (options?.enableFastPathResourceBlocking === false) {
+    return false;
+  }
+
+  const resourceType = (input.resourceType ?? '').trim().toLowerCase();
+  const method = (input.method ?? 'GET').trim().toUpperCase();
+  const rawUrl = (input.url ?? '').trim();
+  const lowerUrl = rawUrl.toLowerCase();
+  const hostname = extractHostnameSafe(rawUrl);
+
+  if (resourceType === 'document') {
+    return false;
+  }
+
+  const matchesDefaultTracker =
+    hostname.length > 0 &&
+    DEFAULT_FAST_PATH_BLOCKED_TRACKER_DOMAINS.some(
+      (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
+    );
+
+  const matchesCustomTracker = (options?.additionalBlockedDomainSubstrings ?? []).some(
+    (rawSub) => {
+      const sub = rawSub.trim().toLowerCase();
+      if (!sub) return false;
+      if (sub.includes('/') || !hostname) {
+        return lowerUrl.includes(sub);
+      }
+      return hostname.includes(sub);
+    }
+  );
+
+  if (matchesDefaultTracker || matchesCustomTracker) {
+    return true;
+  }
+
+  if (
+    resourceType === 'script' ||
+    resourceType === 'xhr' ||
+    resourceType === 'fetch' ||
+    method === 'POST'
+  ) {
+    return false;
+  }
+
+  if (resourceType === 'stylesheet') {
+    return options?.blockStylesheets === true;
+  }
+
+  const blockedTypes = new Set<string>(DEFAULT_FAST_PATH_BLOCKED_RESOURCE_TYPES);
+  if (options?.additionalBlockedResourceTypes) {
+    for (const entry of options.additionalBlockedResourceTypes) {
+      const normalized = entry.trim().toLowerCase();
+      if (
+        normalized &&
+        normalized !== 'document' &&
+        normalized !== 'script' &&
+        normalized !== 'xhr' &&
+        normalized !== 'fetch'
+      ) {
+        blockedTypes.add(normalized);
+      }
+    }
+  }
+
+  return blockedTypes.has(resourceType);
+}
+
+/**
+ * Idempotently installs a catch-all `page.route(...)` handler on `page` using a `WeakSet`
+ * guard so non-essential visual/tracker requests are aborted at most once per `Page`.
+ */
+export async function ensureFastPathResourceBlockingInstalled(
+  page: PlaywrightPageLike,
+  options?: FastPathResourceBlockerOptions,
+  logger?: AuthLoggerPort
+): Promise<boolean> {
+  const safeLogger = logger ? createRedactingLogger(logger) : undefined;
+  if (options?.enableFastPathResourceBlocking === false) {
+    return false;
+  }
+  if (!page || typeof page !== 'object' || typeof page.route !== 'function') {
+    safeLogger?.debug(
+      'Skipping Playwright fast-path resource blocking: page.route is unavailable.'
+    );
+    return false;
+  }
+  if (fastPathBlockedPages.has(page)) {
+    return true;
+  }
+
+  fastPathBlockedPages.add(page);
+  try {
+    await page.route('**/*', async (route, requestArg) => {
+      const req =
+        requestArg ??
+        (typeof route.request === 'function' ? route.request() : undefined);
+      const url = req ? req.url() : '';
+      const resourceType =
+        req && typeof req.resourceType === 'function' ? req.resourceType() : undefined;
+      const method =
+        req && typeof req.method === 'function' ? req.method() : undefined;
+
+      try {
+        if (shouldBlockFastPathRequest({ url, resourceType, method }, options)) {
+          await route.abort();
+          return;
+        }
+        await route.continue();
+      } catch (routeErr) {
+        safeLogger?.debug(
+          `Playwright fast-path route handling skipped for settled/closed route: ${redactSensitiveErrorText(routeErr)}`
+        );
+      }
+    });
+    return true;
+  } catch (err) {
+    fastPathBlockedPages.delete(page);
+    safeLogger?.warn(
+      `Failed to install Playwright fast-path resource blocker: ${redactSensitiveErrorText(err)}`
+    );
+    return false;
+  }
 }
 
 export interface PlaywrightAuthPageDriverOptions {
@@ -66,6 +264,15 @@ export interface PlaywrightAuthPageDriverOptions {
    * error occurs during a 302/SAML redirect. Defaults to `2`.
    */
   maxTransientRetries?: number;
+  /**
+   * Opt-in Tier 2 fast-path resource blocking (`image`, `font`, `media`, tracker domains)
+   * automatically installed via `page.route(...)` before navigation.
+   */
+  enableFastPathResourceBlocking?: boolean;
+  /**
+   * Fine-grained configuration for Tier 2 fast-path resource blocking.
+   */
+  fastPathResourceBlockerOptions?: FastPathResourceBlockerOptions;
 }
 
 function isTransientNavigationError(err: unknown): boolean {
@@ -82,6 +289,23 @@ function isTransientNavigationError(err: unknown): boolean {
   );
 }
 
+export function resolveFastPathResourceBlockerOptions(options: {
+  enableFastPathResourceBlocking?: boolean;
+  fastPathResourceBlockerOptions?: FastPathResourceBlockerOptions;
+}): FastPathResourceBlockerOptions | undefined {
+  const enabled =
+    options.enableFastPathResourceBlocking ??
+    options.fastPathResourceBlockerOptions?.enableFastPathResourceBlocking ??
+    false;
+  if (!enabled) {
+    return undefined;
+  }
+  return {
+    ...options.fastPathResourceBlockerOptions,
+    enableFastPathResourceBlocking: true
+  };
+}
+
 /**
  * `FederatedAuthPageDriverPort` implementation backed by a Playwright `Page`.
  * Automatically injects `window.__PoliAuthAdapters`, passes declarative `FederatedSsoProviderSpec`
@@ -92,6 +316,7 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
   public readonly federatedProviderId: string;
   private readonly page: PlaywrightPageLike;
   private readonly options: PlaywrightAuthPageDriverOptions;
+  private readonly fastPathBlockerOptions?: FastPathResourceBlockerOptions;
   private readonly logger?: AuthLoggerPort;
   private readonly flowSpec: PolimiLoginFlowSpec = POLIMI_LOGIN_FLOW_SPEC;
   private lastNavigationHttpStatus?: number;
@@ -101,7 +326,23 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
     this.page = page;
     this.options = options;
     this.federatedProviderId = options.federatedProviderSpec?.providerId ?? '';
+    this.fastPathBlockerOptions = resolveFastPathResourceBlockerOptions(options);
     this.logger = options.logger ? createRedactingLogger(options.logger) : undefined;
+  }
+
+  /**
+   * Installs the Tier 2 fast-path asset blocker (`page.route(...)`) on the
+   * bound Playwright `Page` if `enableFastPathResourceBlocking` is enabled.
+   */
+  public async installFastPathResourceBlocker(): Promise<boolean> {
+    if (!this.fastPathBlockerOptions) {
+      return false;
+    }
+    return ensureFastPathResourceBlockingInstalled(
+      this.page,
+      this.fastPathBlockerOptions,
+      this.logger
+    );
   }
 
   private safeCurrentUrl(): string {
@@ -198,6 +439,7 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
     this.lastNavigationHttpStatus = undefined;
     this.lastNavigationUrl = undefined;
     try {
+      await this.installFastPathResourceBlocker();
       const response = await this.page.goto(url, {
         waitUntil: 'domcontentloaded',
         timeout: timeoutMs ?? this.options.navigationTimeoutMs ?? 35_000

@@ -241,4 +241,5 @@ To prevent infrastructure outages from masquerading as HTML selector drift (and 
 | Storage & Session Pool ISP | Segregated interfaces with composite backwards-compatible ports | Verified |
 | Outage vs. Selector Drift Disambiguation | `PoliAuthFailureClassification`, `classifyPolimiFailure`, `PoliAuthDiagnosticError` | Verified (`[FACT:EXEC]`) |
 | Typecheck across all 5 packages | 0 errors (`npm run typecheck`) | Verified |
-| Vitest test suites | 14/14 test files, 87/87 tests passing (`npm test`) | Verified (`[FACT:EXEC]`) |
+| Vitest test suites | 14/14 test files, 103/103 tests passing (`npm test`) | Verified (`[FACT:EXEC]`) |
+| Tier 1 Session Probing & Tier 2 Fast-Path Blocker | `tryPreHydrationSessionProbe`, `DEFAULT_POLIMI_SESSION_PROBE_URL`, `ensureFastPathResourceBlockingInstalled`, `shouldBlockFastPathRequest` | Verified (`[FACT:EXEC]`) |

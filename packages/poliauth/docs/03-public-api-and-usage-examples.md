@@ -255,3 +255,10 @@ await auth.authenticate(
   { enableSingleflight: false }
 );
 ```
+
+---
+
+## Tier 1 Pre-Hydration Session Probing & Tier 2 Fast-Path Blocker (`TASK-7.3`)
+
+- **Pre-Hydration Session Probing (`PoliAuth` & `PoliAuthOrchestrator`)**: When `sessionPool` restores persisted browser session state (`hasRestoredSessionState`, `context.restoredState`, or non-empty `storageState().cookies`), `PoliAuth.authenticate({ userId })` automatically probes `DEFAULT_POLIMI_SESSION_PROBE_URL` (`https://servizionline.polimi.it/portaleservizi/`) first (or runs an immediate pre-navigation inspection if the tab is already on PoliMi). A verified `'authenticated'` stage short-circuits full login with `{ ok: true, status: 'authenticated', sessionReused: true, preHydrationProbeHit: true }`; `'session_expired'` / `'credentials'` / other unauthenticated stages seamlessly fall back to `serviceEntryUrl`. Configure globally on `PoliAuthConfig` or per request via `probeExistingSession` and `sessionProbeUrl` (`reauth_required` fast-fail still runs pre-browser before context acquisition).
+- **Playwright Fast-Path Asset Blocker (`@polisdk/poliauth-playwright`)**: Enable `enableFastPathResourceBlocking: true` (and optional `fastPathResourceBlockerOptions`) on `PlaywrightBrowserSessionPool` (`PlaywrightSessionPoolOptions` / `PlaywrightBrowserSessionPoolOptions`) or `PlaywrightAuthPageDriver` to register an idempotent (`WeakSet`-guarded) `page.route('**/*', ...)` handler before `goto()` that aborts `image`, `font`, `media`, and analytics/tracker domains while keeping `document`, `script`, `xhr`, `fetch`, `POST` submissions, and default `stylesheet` intact.

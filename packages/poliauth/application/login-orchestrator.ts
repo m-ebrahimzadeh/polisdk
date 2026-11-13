@@ -16,6 +16,7 @@ import {
   type LoginFlowStatus,
   type PoliAuthDiagnosticErrorPayload,
   type PoliAuthFailureClassification,
+  type PolimiPageStage,
   type PolimiSemanticErrorCode,
   type PolimiStageInspectionResult
 } from '../domain/entities.js';
@@ -42,12 +43,25 @@ export type PoliAuthIdentityRepository = Partial<
   UserIdentityReaderPort & UserIdentityWriterPort
 >;
 
+export const DEFAULT_POLIMI_SESSION_PROBE_URL =
+  `https://${POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.portalHostname}${POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.portalPathnameSubstring}`;
+
 export interface PoliAuthExecutionOptions {
   /**
    * Deduplicate concurrent requests for the same user/target via an in-memory
    * singleflight registry. Default: `true`.
    */
   enableSingleflight?: boolean;
+  /**
+   * Probe an existing/restored session via `sessionProbeUrl` before initiating a
+   * full multi-stage login at `serviceEntryUrl`.
+   */
+  enablePreHydrationSessionProbe?: boolean;
+  /**
+   * Optional override URL used during Tier 1 pre-hydration session probing.
+   * Defaults to `DEFAULT_POLIMI_SESSION_PROBE_URL`.
+   */
+  sessionProbeUrl?: string;
 }
 
 export interface PoliAuthOrchestratorDependencies {
@@ -56,6 +70,10 @@ export interface PoliAuthOrchestratorDependencies {
   identityRepository?: PoliAuthIdentityRepository;
   /** Enable per-user singleflight deduplication across concurrent calls. Default: `true`. */
   enableSingleflight?: boolean;
+  /** Enable Tier 1 pre-hydration session probing by default across calls. Default: `false`. */
+  enablePreHydrationSessionProbe?: boolean;
+  /** Custom Tier 1 session probe URL. Defaults to `DEFAULT_POLIMI_SESSION_PROBE_URL`. */
+  sessionProbeUrl?: string;
 }
 
 export type PoliAuthOrchestratorOptions = Omit<
@@ -277,6 +295,16 @@ export interface PolimiSessionAuthRequest {
    * Optional custom SSO entry URL. Defaults to `POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl`.
    */
   entryUrl?: string;
+  /**
+   * When `true`, probes an existing/hydrated PoliMi session on `sessionProbeUrl` before
+   * navigating to `entryUrl` (`getservizio.xml?id_servizio=376`).
+   */
+  probeExistingSession?: boolean;
+  /**
+   * Optional override URL for Tier 1 pre-hydration session probing.
+   * Defaults to `DEFAULT_POLIMI_SESSION_PROBE_URL`.
+   */
+  sessionProbeUrl?: string;
   /** Maximum state-machine iterations before timing out. Default: 40. */
   maxSteps?: number;
   /** Poll delay in milliseconds between intermediate steps. Default: 400. */
@@ -301,7 +329,10 @@ export interface PolimiSessionAuthRequest {
 export interface PolimiSessionAuthOutcome {
   ok: boolean;
   status: LoginFlowStatus;
+  stage?: PolimiPageStage;
   url?: string;
+  sessionReused?: boolean;
+  preHydrationProbeHit?: boolean;
   error?: string;
   classification?: PoliAuthFailureClassification;
   semanticErrorCode?: PolimiSemanticErrorCode;
@@ -375,6 +406,8 @@ export class PoliAuthOrchestrator {
   private readonly logger?: AuthLoggerPort;
   private readonly identityRepository?: PoliAuthIdentityRepository;
   private readonly enableSingleflight: boolean;
+  private readonly enablePreHydrationSessionProbe: boolean;
+  private readonly sessionProbeUrl: string;
   private readonly inFlightAuth = new Map<string, Promise<PolimiSessionAuthOutcome>>();
   private readonly inFlightFederatedAuth = new Map<
     string,
@@ -397,18 +430,28 @@ export class PoliAuthOrchestrator {
         : undefined;
       this.identityRepository = otpCoordinatorOrDeps.identityRepository;
       this.enableSingleflight = otpCoordinatorOrDeps.enableSingleflight ?? true;
+      this.enablePreHydrationSessionProbe =
+        otpCoordinatorOrDeps.enablePreHydrationSessionProbe ?? false;
+      this.sessionProbeUrl =
+        otpCoordinatorOrDeps.sessionProbeUrl ?? DEFAULT_POLIMI_SESSION_PROBE_URL;
     } else {
       this.otpCoordinator = otpCoordinatorOrDeps;
       if (isAuthLoggerPort(loggerOrOptions)) {
         this.logger = createRedactingLogger(loggerOrOptions);
         this.identityRepository = undefined;
         this.enableSingleflight = true;
+        this.enablePreHydrationSessionProbe = false;
+        this.sessionProbeUrl = DEFAULT_POLIMI_SESSION_PROBE_URL;
       } else {
         this.logger = loggerOrOptions?.logger
           ? createRedactingLogger(loggerOrOptions.logger)
           : undefined;
         this.identityRepository = loggerOrOptions?.identityRepository;
         this.enableSingleflight = loggerOrOptions?.enableSingleflight ?? true;
+        this.enablePreHydrationSessionProbe =
+          loggerOrOptions?.enablePreHydrationSessionProbe ?? false;
+        this.sessionProbeUrl =
+          loggerOrOptions?.sessionProbeUrl ?? DEFAULT_POLIMI_SESSION_PROBE_URL;
       }
     }
   }
@@ -501,12 +544,120 @@ export class PoliAuthOrchestrator {
           ...(normalizedUser ? { userId: normalizedUser } : { keyType: 'personCode' })
         });
       },
-      execute: () => this.executeAuthenticate(req)
+      execute: () => this.executeAuthenticate(req, options)
     });
   }
 
+  private async tryPreHydrationSessionProbe(params: {
+    driver: AuthPageDriverPort;
+    probeUrl: string;
+    pollDelayMs: number;
+  }): Promise<{ authenticated: true; url: string } | { authenticated: false }> {
+    const { driver, probeUrl, pollDelayMs } = params;
+    try {
+      await driver.goto(probeUrl);
+      if (pollDelayMs > 0) {
+        await driver
+          .waitForNavigation(Math.min(Math.max(pollDelayMs * 3, 1_000), 2_500))
+          .catch((err) => {
+            this.logger?.debug(
+              'Pre-hydration session probe waitForNavigation did not settle.',
+              redactSensitiveErrorText(err)
+            );
+          });
+      }
+    } catch (err) {
+      const probeFailure = classifyPolimiFailure({
+        component: '@polisdk/poliauth/application/login-orchestrator',
+        operation: 'probeExistingSession',
+        stage: 'entry',
+        url: probeUrl,
+        selectorOrEndpoint: probeUrl,
+        error: err
+      });
+      if (probeFailure.classification === 'TARGET_CLOSED') {
+        throw err;
+      }
+      this.logger?.warn(
+        `Pre-hydration session probe navigation failed; continuing to full PoliMi login: ${probeFailure.message}`,
+        probeFailure
+      );
+      return { authenticated: false };
+    }
+
+    const inspectProbeStage = async (): Promise<PolimiStageInspectionResult> => {
+      try {
+        return await driver.inspectPolimiStage();
+      } catch (err) {
+        if (isTransientNavigationError(err)) {
+          this.logger?.debug(
+            'Transient navigation error inspecting pre-hydration probe stage; retrying once.',
+            redactSensitiveErrorText(err)
+          );
+          if (pollDelayMs > 0) {
+            await driver
+              .waitForNavigation(Math.min(Math.max(pollDelayMs * 3, 1_000), 2_000))
+              .catch((waitErr) => {
+                this.logger?.debug(
+                  'Pre-hydration retry waitForNavigation did not settle.',
+                  redactSensitiveErrorText(waitErr)
+                );
+              });
+          }
+          try {
+            return await driver.inspectPolimiStage();
+          } catch (retryErr) {
+            const retryFailure = classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'probeExistingSession',
+              url: probeUrl,
+              error: retryErr
+            });
+            if (retryFailure.classification === 'TARGET_CLOSED') {
+              throw retryErr;
+            }
+            this.logger?.debug(
+              'Pre-hydration probe retry inspection interrupted; continuing to full login.',
+              redactSensitiveErrorText(retryErr)
+            );
+            return { stage: 'unknown', url: probeUrl, title: '' };
+          }
+        }
+        const inspectFailure = classifyPolimiFailure({
+          component: '@polisdk/poliauth/application/login-orchestrator',
+          operation: 'probeExistingSession',
+          url: probeUrl,
+          error: err
+        });
+        if (inspectFailure.classification === 'TARGET_CLOSED') {
+          throw err;
+        }
+        this.logger?.debug(
+          'Pre-hydration probe inspection failed; continuing to full login.',
+          redactSensitiveErrorText(err)
+        );
+        return { stage: 'unknown', url: probeUrl, title: '' };
+      }
+    };
+
+    const probeStage = await inspectProbeStage();
+    if (probeStage.stage === 'authenticated') {
+      return { authenticated: true, url: probeStage.url };
+    }
+
+    this.logger?.debug(
+      'Pre-hydration session probe did not find an active session; falling back to standard PoliMi login.',
+      {
+        probeStage: probeStage.stage,
+        probeUrl: redactSecrets(probeUrl)
+      }
+    );
+    return { authenticated: false };
+  }
+
   private async executeAuthenticate(
-    req: PolimiSessionAuthRequest
+    req: PolimiSessionAuthRequest,
+    options?: PoliAuthExecutionOptions
   ): Promise<PolimiSessionAuthOutcome> {
     const {
       userId,
@@ -522,6 +673,16 @@ export class PoliAuthOrchestrator {
       callbacks,
       onAuthenticated
     } = req;
+
+    const enablePreHydrationProbe =
+      req.probeExistingSession ??
+      options?.enablePreHydrationSessionProbe ??
+      this.enablePreHydrationSessionProbe;
+    const resolvedProbeUrl =
+      req.sessionProbeUrl ??
+      options?.sessionProbeUrl ??
+      this.sessionProbeUrl ??
+      DEFAULT_POLIMI_SESSION_PROBE_URL;
 
     const effectiveMaxManualOtpAttempts = Math.max(1, maxManualOtpAttempts);
 
@@ -545,6 +706,14 @@ export class PoliAuthOrchestrator {
       const initialStage = await driver
         .inspectPolimiStage()
         .catch((err) => {
+          const initFailure = classifyPolimiFailure({
+            component: '@polisdk/poliauth/application/login-orchestrator',
+            operation: 'inspectPolimiStage',
+            error: err
+          });
+          if (initFailure.classification === 'TARGET_CLOSED') {
+            throw err;
+          }
           this.logger?.debug(
             'Initial PoliMi stage inspection interrupted; proceeding to login entry URL.',
             redactSensitiveErrorText(err)
@@ -558,8 +727,32 @@ export class PoliAuthOrchestrator {
         return {
           ok: true,
           status: 'authenticated',
-          url: initialStage.url
+          stage: 'authenticated',
+          url: initialStage.url,
+          sessionReused: true,
+          preHydrationProbeHit: true
         };
+      }
+
+      if (enablePreHydrationProbe) {
+        await notify('opening_login', 'Checking existing PoliMi session...');
+        const probeResult = await this.tryPreHydrationSessionProbe({
+          driver,
+          probeUrl: resolvedProbeUrl,
+          pollDelayMs
+        });
+        if (probeResult.authenticated) {
+          await onAuthenticated?.();
+          await notify('authenticated', 'Authenticated via existing PoliMi session.');
+          return {
+            ok: true,
+            status: 'authenticated',
+            stage: 'authenticated',
+            url: probeResult.url,
+            sessionReused: true,
+            preHydrationProbeHit: true
+          };
+        }
       }
 
       await notify('opening_login', 'Opening PoliMi SSO login...');
@@ -598,7 +791,10 @@ export class PoliAuthOrchestrator {
           return {
             ok: true,
             status: 'authenticated',
-            url: stageInfo.url
+            stage: 'authenticated',
+            url: stageInfo.url,
+            sessionReused: false,
+            preHydrationProbeHit: false
           };
         }
 
