@@ -16,9 +16,9 @@
 
 | Import Path | Contents |
 |---|---|
-| `@polisdk/poliauth` | Unified `PoliAuth` facade + re-exports of all core layers |
+| `@polisdk/poliauth` | Unified `PoliAuth` facade (`PoliAuthConfig`, `PoliAuthDriverFactory`, `PoliAuthClientSessionRequest`, `PoliAuthClientFederatedSamlRequest`, `PoliAuthSessionCredentials`) + re-exports of all core layers |
 | `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`, `PolimiStageInspectionResult`, `FederatedSsoInspectionResult`), `TotpService`, `cleanTotpSecret`, `isValidTotpSecret`, `decodeBase32`, `generateTotp`, `generateStableTotp`, `getTotpRemainingSeconds`, `TotpOptions`, `StableTotpOptions`, `StableTotpResult`, `TotpGeneratorPort`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation/merge utilities (`isValidPersonCode`, `isValidPolimiEmail`, `isValidOtpCode`, `mergeVaultCredentials`, `maskSecret`, `maskPersonCode`, `maskPolimiEmail`), and redaction primitives (`RedactionRule`, `redactSecrets`, `redactSensitiveErrorText`) |
-| `@polisdk/poliauth/application` | `PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService`, `createRedactingLogger` |
+| `@polisdk/poliauth/application` | `PoliAuthOrchestrator`, `PoliAuthOrchestratorDependencies`, `PoliAuthOrchestratorOptions`, `PoliAuthExecutionOptions`, `resolveUserSingleflightKey`, `resolveFederatedSingleflightKey`, `executeWithSingleflight`, `checkPreBrowserCircuitBreakerForIdentity`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService`, `createRedactingLogger` |
 | `@polisdk/poliauth/interfaces` | Segregated role ports: `AuthPageDriverPort`, `PageNavigationPort`, `PolimiIdpPagePort`, `FederatedSsoPageDriverPort`, `FederatedAuthPageDriverPort`, `FederatedSsoProviderAdapterPort`, `FederatedSsoProviderResolverPort`, `FederatedSsoProviderSpec`, `FederatedIdentifierPromptSpec`, `FederatedLoginTriggerSpec`, `VaultStoragePort`, `VaultSecretMaterialPort`, `UserVaultStorageFactoryPort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `UserIdentityProvisionerPort`, `UserIdentityReaderPort`, `UserIdentityWriterPort`, `SessionContextPoolPort`, `SessionContextLeasePort`, `SessionContextPersistencePort`, `SessionContextDisposalPort`, `SessionPoolStatsPort`, `OtpChallengeProviderPort`, `OtpCodeProviderPort`, `ManualOtpChallengePort`, `AuthorizationServicePort`, `AccessEvaluatorPort`, `SubjectRoleQueryPort`, `ResourceAuthorizerPort`, `ResourceAuthorizationPolicyPort`, `AuthLoggerPort`, `MaybePromise` |
 | `@polisdk/poliauth/storage` | `EncryptedCredentialVault`, `saveEncryptedCredentials`, `loadEncryptedCredentials`, `clearEncryptedCredentials`, `saveEncryptedSessionState`, `loadEncryptedSessionState`, `clearEncryptedSessionState`, `InMemoryVaultStorage`, `InMemoryUserVaultStorageFactory`, `InMemorySessionStateStore`, `InMemoryUserIdentityRepository` |
 | `@polisdk/poliauth/adapters` | `DomAuthPageDriver`, `DomFederatedAuthPageDriver`, `polimi-dom-adapter`, `webex-sso-dom-adapter` (`WebexSamlProviderAdapter`, `WEBEX_SAML_FLOW_SPEC`, `createWebexSamlFlowSpec`), `federated-sso-dom-adapter` (`SelectorFederatedSsoProviderAdapter`, `inspectFederatedSsoPageBySpec`, `isFederatedLoginTriggerPage`, `submitFederatedIdentifierBySpec`, `triggerFederatedLoginBySpec`), `federated-sso-provider-registry` (`FederatedSsoProviderRegistry`, `createDefaultFederatedSsoProviderRegistry`) |
@@ -201,3 +201,57 @@ When `PoliAuth` (or `PoliAuthOrchestrator` / `CredentialSetupWizard`) is wired w
 3. **Stage 2 `OTP_REJECTED` policy**: On 1st auto-TOTP rejection, status stays unchanged, the orchestrator waits for the next 30-second RFC 6238 TOTP window, and retries `submitOtp` once; a 2nd consecutive failure (or reaching `maxManualOtpAttempts`) trips `'reauth_required'`.
 4. **Maintenance & drift preservation**: `IDP_MAINTENANCE` (`PORTAL_OUTAGE_OR_NETWORK_ERROR`) and `DOM_SELECTOR_DRIFT` never mark a user `'reauth_required'`.
 5. **Credential reset**: Completing `CredentialSetupWizard` or calling `PoliAuth.saveCredentials(..., identityId)` resets `'reauth_required'` back to `'idle'` and clears `loginError`.
+
+---
+
+## 8. Per-User Singleflight Deduplication & Pool-Managed `PoliAuth` Leases (`TASK-7.2`)
+
+Concurrent commands for the same user (e.g., rapid button clicks or parallel background sync tasks) share a single in-flight authentication Promise across both `PoliAuth` and `PoliAuthOrchestrator`, preventing 30-second RFC 6238 TOTP replay collisions while allowing distinct users (or distinct federated targets) to run in parallel.
+
+### Option A1 — Pool-Managed `PoliAuth` with `driverFactory` (`driver` & `credentials` optional)
+
+```ts
+import { PoliAuth } from '@polisdk/poliauth';
+import { PlaywrightAuthPageDriver, PlaywrightBrowserSessionPool } from '@polisdk/poliauth-playwright';
+import { PoliAuthSqliteDatabase, SqliteSessionStateStore, SqliteUserVaultStorageFactory } from '@polisdk/storage-sqlite';
+
+const db = new PoliAuthSqliteDatabase('./data/poliauth.sqlite');
+const masterKey = process.env.MASTER_KEY!;
+const pool = new PlaywrightBrowserSessionPool({
+  sessionStateStore: new SqliteSessionStateStore(db, masterKey)
+});
+
+const auth = new PoliAuth({
+  userStorageFactory: new SqliteUserVaultStorageFactory(db, masterKey),
+  identityRepository: db,
+  sessionPool: pool,
+  driverFactory: (page) => new PlaywrightAuthPageDriver(page)
+});
+
+// 5 concurrent callers share 1 vault load, 1 acquireUserContext, 1 driverFactory call, 1 TOTP login, 1 saveUserContextState, and 1 releaseUserContext
+await Promise.all([
+  auth.authenticate({ userId: 1001 }),
+  auth.authenticate({ userId: 1001 }),
+  auth.authenticate({ userId: 1001 }),
+  auth.authenticate({ userId: 1001 }),
+  auth.authenticate({ userId: 1001 })
+]);
+
+// Federated SAML flows deduplicate per user + target (`entryUrl` or `federatedProviderId`)
+await auth.authenticateFederatedSaml({
+  userId: 1001,
+  entryUrl: 'https://polimi.webex.com'
+});
+```
+
+### Observability & Opt-Out (`enableSingleflight`)
+
+- `auth.orchestrator.getInFlightCount()` returns the total active singleflight flows (standard + federated SAML), and `isUserAuthenticationInFlight(userId)` is available on both `PoliAuth` and `PoliAuthOrchestrator`.
+- Explicit-driver calls (`auth.authenticate({ userId, driver, credentials })`) remain 100% backward-compatible and bypass `sessionPool`, still receiving orchestrator-level singleflight deduplication unless disabled via `enableSingleflight: false` on `PoliAuthConfig`, `PoliAuthOrchestratorDependencies`, or per-call `PoliAuthExecutionOptions`:
+
+```ts
+await auth.authenticate(
+  { userId: 1001, driver, credentials },
+  { enableSingleflight: false }
+);
+```

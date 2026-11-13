@@ -9,6 +9,7 @@
 import {
   classifyPolimiFailure,
   classifyPolimiSemanticError,
+  normalizeIdentityId,
   PoliAuthDiagnosticError,
   type IdentityId,
   type LoginCredentials,
@@ -18,7 +19,7 @@ import {
   type PolimiSemanticErrorCode,
   type PolimiStageInspectionResult
 } from '../domain/entities.js';
-import { redactSensitiveErrorText } from '../domain/redaction.js';
+import { redactSecrets, redactSensitiveErrorText } from '../domain/redaction.js';
 import { getTotpRemainingSeconds } from '../domain/totp.js';
 import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
 import type {
@@ -41,16 +42,122 @@ export type PoliAuthIdentityRepository = Partial<
   UserIdentityReaderPort & UserIdentityWriterPort
 >;
 
+export interface PoliAuthExecutionOptions {
+  /**
+   * Deduplicate concurrent requests for the same user/target via an in-memory
+   * singleflight registry. Default: `true`.
+   */
+  enableSingleflight?: boolean;
+}
+
 export interface PoliAuthOrchestratorDependencies {
   otpCoordinator: OtpChallengeProviderPort;
   logger?: AuthLoggerPort;
   identityRepository?: PoliAuthIdentityRepository;
+  /** Enable per-user singleflight deduplication across concurrent calls. Default: `true`. */
+  enableSingleflight?: boolean;
 }
 
 export type PoliAuthOrchestratorOptions = Omit<
   PoliAuthOrchestratorDependencies,
   'otpCoordinator'
 >;
+
+export function resolveUserSingleflightKey(
+  userId: IdentityId | undefined,
+  personCode?: string
+): string | null {
+  if (userId !== undefined && userId !== null) {
+    const normalized = normalizeIdentityId(userId);
+    if (normalized.length > 0) {
+      return `user:${normalized}`;
+    }
+  }
+  const normalizedPersonCode = personCode?.trim() || '';
+  if (normalizedPersonCode.length > 0) {
+    return `personCode:${normalizedPersonCode}`;
+  }
+  return null;
+}
+
+export function resolveFederatedSingleflightKey(
+  userId: IdentityId | undefined,
+  personCode: string | undefined,
+  entryUrl?: string,
+  providerId?: string
+): string | null {
+  const userKey = resolveUserSingleflightKey(userId, personCode);
+  if (!userKey) {
+    return null;
+  }
+  const providerKeyOrEntryUrl =
+    entryUrl?.trim() || providerId?.trim() || 'default';
+  return `${userKey}::federated::${providerKeyOrEntryUrl}`;
+}
+
+export async function executeWithSingleflight<T>(params: {
+  registry: Map<string, Promise<T>>;
+  key: string | null;
+  enabled: boolean;
+  execute: () => Promise<T>;
+  onJoin?: () => void;
+}): Promise<T> {
+  const { registry, key, enabled, execute, onJoin } = params;
+  if (!enabled || !key) {
+    return execute();
+  }
+
+  const existing = registry.get(key);
+  if (existing) {
+    onJoin?.();
+    return existing;
+  }
+
+  let settled = false;
+  let inFlight!: Promise<T>;
+  inFlight = (async () => {
+    try {
+      return await execute();
+    } finally {
+      settled = true;
+      if (registry.get(key) === inFlight) {
+        registry.delete(key);
+      }
+    }
+  })();
+
+  if (!settled) {
+    registry.set(key, inFlight);
+  }
+  return inFlight;
+}
+
+export async function checkPreBrowserCircuitBreakerForIdentity(
+  identityRepository: PoliAuthIdentityRepository | undefined,
+  userId: IdentityId | undefined,
+  logger?: AuthLoggerPort
+): Promise<string | null> {
+  if (
+    userId === undefined ||
+    userId === null ||
+    normalizeIdentityId(userId).length === 0 ||
+    !identityRepository?.getUser
+  ) {
+    return null;
+  }
+  const existingUser = await identityRepository.getUser(userId);
+  if (existingUser?.loginStatus !== 'reauth_required') {
+    return null;
+  }
+  const reason = existingUser.loginError
+    ? `PoliMi login blocked by reauth_required circuit breaker: ${existingUser.loginError}. Update credentials to reset account status.`
+    : 'PoliMi login blocked by reauth_required circuit breaker. Update credentials to reset account status.';
+  const safeReason = redactSensitiveErrorText(reason);
+  logger?.warn(
+    `Pre-browser circuit breaker fast-fail for user ${normalizeIdentityId(userId)}: ${safeReason}`
+  );
+  return safeReason;
+}
 
 function isAuthLoggerPort(value: unknown): value is AuthLoggerPort {
   return (
@@ -267,6 +374,12 @@ export class PoliAuthOrchestrator {
   private readonly otpCoordinator: OtpChallengeProviderPort;
   private readonly logger?: AuthLoggerPort;
   private readonly identityRepository?: PoliAuthIdentityRepository;
+  private readonly enableSingleflight: boolean;
+  private readonly inFlightAuth = new Map<string, Promise<PolimiSessionAuthOutcome>>();
+  private readonly inFlightFederatedAuth = new Map<
+    string,
+    Promise<FederatedSamlAuthOutcome>
+  >();
 
   constructor(dependencies: PoliAuthOrchestratorDependencies);
   constructor(
@@ -283,34 +396,58 @@ export class PoliAuthOrchestrator {
         ? createRedactingLogger(otpCoordinatorOrDeps.logger)
         : undefined;
       this.identityRepository = otpCoordinatorOrDeps.identityRepository;
+      this.enableSingleflight = otpCoordinatorOrDeps.enableSingleflight ?? true;
     } else {
       this.otpCoordinator = otpCoordinatorOrDeps;
       if (isAuthLoggerPort(loggerOrOptions)) {
         this.logger = createRedactingLogger(loggerOrOptions);
         this.identityRepository = undefined;
+        this.enableSingleflight = true;
       } else {
         this.logger = loggerOrOptions?.logger
           ? createRedactingLogger(loggerOrOptions.logger)
           : undefined;
         this.identityRepository = loggerOrOptions?.identityRepository;
+        this.enableSingleflight = loggerOrOptions?.enableSingleflight ?? true;
       }
     }
   }
 
+  /**
+   * Returns the total count of active singleflight authentication flows
+   * across both standard PoliMi SSO and federated SAML SSO.
+   */
+  public getInFlightCount(): number {
+    return this.inFlightAuth.size + this.inFlightFederatedAuth.size;
+  }
+
+  /**
+   * Returns `true` if `userId` currently has an active in-flight singleflight
+   * execution in either standard or federated SSO authentication.
+   */
+  public isUserAuthenticationInFlight(userId: IdentityId): boolean {
+    const userKey = resolveUserSingleflightKey(userId);
+    if (!userKey) {
+      return false;
+    }
+    if (this.inFlightAuth.has(userKey)) {
+      return true;
+    }
+    const federatedPrefix = `${userKey}::federated::`;
+    for (const key of this.inFlightFederatedAuth.keys()) {
+      if (key.startsWith(federatedPrefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private async checkPreBrowserCircuitBreaker(userId: IdentityId): Promise<string | null> {
-    if (!userId || !this.identityRepository?.getUser) {
-      return null;
-    }
-    const existingUser = await this.identityRepository.getUser(userId);
-    if (existingUser?.loginStatus !== 'reauth_required') {
-      return null;
-    }
-    const reason = existingUser.loginError
-      ? `PoliMi login blocked by reauth_required circuit breaker: ${existingUser.loginError}. Update credentials to reset account status.`
-      : 'PoliMi login blocked by reauth_required circuit breaker. Update credentials to reset account status.';
-    const safeReason = redactSensitiveErrorText(reason);
-    this.logger?.warn(`Pre-browser circuit breaker fast-fail for user ${String(userId)}: ${safeReason}`);
-    return safeReason;
+    return checkPreBrowserCircuitBreakerForIdentity(
+      this.identityRepository,
+      userId,
+      this.logger
+    );
   }
 
   private async tripCircuitBreaker(
@@ -338,8 +475,37 @@ export class PoliAuthOrchestrator {
   /**
    * Executes the Politecnico di Milano SSO + 2FA authentication state machine
    * until an authenticated PoliMi session (`stage === 'authenticated'`) is established.
+   *
+   * Concurrent invocations for the same user identity join a single in-flight Promise
+   * unless `enableSingleflight` is explicitly disabled.
    */
-  public async authenticate(
+  public authenticate(
+    req: PolimiSessionAuthRequest,
+    options?: PoliAuthExecutionOptions
+  ): Promise<PolimiSessionAuthOutcome> {
+    const useSingleflight = options?.enableSingleflight ?? this.enableSingleflight;
+    const key = resolveUserSingleflightKey(req.userId, req.credentials?.personCode);
+
+    return executeWithSingleflight({
+      registry: this.inFlightAuth,
+      key,
+      enabled: useSingleflight,
+      onJoin: () => {
+        const normalizedUser =
+          req.userId !== undefined && req.userId !== null
+            ? normalizeIdentityId(req.userId)
+            : '';
+        this.logger?.info('Joining existing in-flight PoliMi authentication flow.', {
+          scope: 'orchestrator',
+          flow: 'polimi',
+          ...(normalizedUser ? { userId: normalizedUser } : { keyType: 'personCode' })
+        });
+      },
+      execute: () => this.executeAuthenticate(req)
+    });
+  }
+
+  private async executeAuthenticate(
     req: PolimiSessionAuthRequest
   ): Promise<PolimiSessionAuthOutcome> {
     const {
@@ -1469,8 +1635,47 @@ export class PoliAuthOrchestrator {
 
   /**
    * Loops `handleFederatedSamlStep` across multi-hop SAML/Shibboleth redirects until authenticated or failed.
+   *
+   * Concurrent invocations for the same user identity and federated target join a single
+   * in-flight Promise unless `enableSingleflight` is explicitly disabled.
    */
-  public async authenticateFederatedSaml(
+  public authenticateFederatedSaml(
+    req: FederatedSamlAuthRequest,
+    options?: PoliAuthExecutionOptions
+  ): Promise<FederatedSamlAuthOutcome> {
+    const useSingleflight = options?.enableSingleflight ?? this.enableSingleflight;
+    const providerId = (
+      req.driver as Partial<FederatedSsoPageDriverPort> | undefined
+    )?.federatedProviderId;
+    const key = resolveFederatedSingleflightKey(
+      req.userId,
+      req.credentials?.personCode,
+      req.entryUrl,
+      providerId
+    );
+
+    return executeWithSingleflight({
+      registry: this.inFlightFederatedAuth,
+      key,
+      enabled: useSingleflight,
+      onJoin: () => {
+        const normalizedUser =
+          req.userId !== undefined && req.userId !== null
+            ? normalizeIdentityId(req.userId)
+            : '';
+        const target = req.entryUrl?.trim() || providerId?.trim() || 'default';
+        this.logger?.info('Joining existing in-flight federated SAML authentication flow.', {
+          scope: 'orchestrator',
+          flow: 'federated_saml',
+          ...(normalizedUser ? { userId: normalizedUser } : { keyType: 'personCode' }),
+          target: redactSecrets(target)
+        });
+      },
+      execute: () => this.executeAuthenticateFederatedSaml(req)
+    });
+  }
+
+  private async executeAuthenticateFederatedSaml(
     req: FederatedSamlAuthRequest
   ): Promise<FederatedSamlAuthOutcome> {
     const {

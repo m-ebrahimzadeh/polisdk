@@ -311,6 +311,10 @@ packages/
 - **Semantic IdP Error Taxonomy**: `classifyPolimiSemanticError`, `PolimiSemanticErrorCode` (`INVALID_CREDENTIALS`, `PASSWORD_EXPIRED`, `ACCOUNT_LOCKED`, `OTP_REJECTED`, `IDP_MAINTENANCE`, `DOM_SELECTOR_DRIFT`), and `POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators` map bilingual PoliMi IdP DOM error markers into structured failure and stage inspection results.
 - **`reauth_required` Circuit Breaker**: `PoliAuthOrchestrator` and `PoliAuth` fast-fail pre-browser when `UserIdentity.loginStatus === 'reauth_required'`, immediately trip `reauth_required` with zero retries on Stage 1 terminal auth failures (`INVALID_CREDENTIALS`, `PASSWORD_EXPIRED`, `ACCOUNT_LOCKED` at any stage), retry automated Stage 2 `OTP_REJECTED` at most once after waiting for the next 30-second RFC 6238 TOTP window before tripping `reauth_required`, preserve existing `loginStatus` on `IDP_MAINTENANCE` / `DOM_SELECTOR_DRIFT`, and deterministically reset `'reauth_required'` -> `'idle'` upon `CredentialSetupWizard` completion or `PoliAuth.saveCredentials`.
 
+### 6.6 Per-User Singleflight Deduplication & Pool-Managed Leasing (`TASK-7.2`)
+- **Orchestrator & Facade Singleflight Registries**: `PoliAuthOrchestrator` (`inFlightAuth`, `inFlightFederatedAuth`) and `PoliAuth` (`facadeInFlightAuth`, `facadeInFlightFederatedAuth`) deduplicate concurrent login requests per normalized user (`user:<normalized>` or `personCode:<personCode>` fallback; `${userKey}::federated::${providerKeyOrEntryUrl}` for federated SAML) so overlapping triggers share a single TOTP/credentials execution and singleflight `Promise`, isolate distinct users and distinct federated targets in parallel, guarantee leak-free `finally` registry cleanup on success, failure, and unhandled rejection, and support opt-out via `enableSingleflight: false` (constructor or `PoliAuthExecutionOptions`) plus `getInFlightCount()` / `isUserAuthenticationInFlight(userId)` observability.
+- **Backward-Compatible Pool-Managed `PoliAuth` Leasing**: When `driver` is omitted on `PoliAuth.authenticate` or `PoliAuth.authenticateFederatedSaml`, `PoliAuth` uses `sessionPool` and `PoliAuthConfig.driverFactory` (`createPageDriver`) inside a facade-level singleflight lease (`reauth_required` fast-fail -> vault credential load -> `acquireUserContext` -> `getOrCreatePrimaryPage` -> `driverFactory` -> orchestrator -> `saveUserContextState` -> `finally { releaseUserContext }`), while explicit-`driver` calls remain 100% backward-compatible and bypass `sessionPool`.
+
 ---
 
 ## 7. Future Extension Recommendations
@@ -337,7 +341,7 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 | :--- | :---: | :---: | :--- |
 | **Modularity** | `3/10` | **`10/10`** | Monolithic codebase decomposed into 5 cleanly bounded packages. `@polisdk/poliauth` has zero runtime dependencies and can run in any modern JS engine. |
 | **Reusability** | `2/10` | **`10/10`** | Pure domain models, TOTP algorithms, and DOM adapters can be embedded in browser extensions, desktop apps, servers, or CLI tools without dragging in SQLite or Playwright. |
-| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 93 automated tests pass across 14 test files. |
+| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 98 automated tests pass across 14 test files. |
 | **Extensibility** | `4/10` | **`10/10`** | Pluggable SPI for federated SAML providers (`FederatedSsoProviderAdapterPort`), declarative JSON specs, pluggable storage adapters (`VaultStoragePort`), and custom resource authorization policies. |
 | **Clean Architecture Compliance** | `2/10` | **`10/10`** | Strict inward dependency direction. Domain has zero external imports. Ports and adapters completely abstract all I/O, database, and browser mechanics. Authentication stops strictly at `'authenticated'`. |
 
@@ -348,7 +352,7 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 ```text
 ✅ Build:          npm run build           --> 5/5 packages compiled cleanly
 ✅ Typecheck:      npm run typecheck       --> 0 errors across entire workspace
-✅ Tests:          npm test                --> 14/14 test files passed, 93/93 tests passing
+✅ Tests:          npm test                --> 14/14 test files passed, 98/98 tests passing
 ✅ Live Probe:     npm run probe:live      --> Stages 0 -> Recovery -> Stage 1 [FACT:LIVE]
 ✅ Auth E2E Probe: npm run probe:live:auth --> Stages 0 -> 1 -> 2 (2FA OTP) -> 3 [FACT:LIVE]
 ```
