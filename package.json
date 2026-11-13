@@ -11,7 +11,8 @@
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "probe:live": "node -e \"process.env.POLIAUTH_LIVE_PROBE='1'; import('node:child_process').then(({spawnSync}) => { const r = spawnSync(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', 'packages/poliauth-playwright/tests/live-portal-probe.test.ts'], { stdio: 'inherit' }); process.exit(r.status ?? 1); })\""
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
