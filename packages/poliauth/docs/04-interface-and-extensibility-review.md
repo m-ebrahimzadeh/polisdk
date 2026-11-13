@@ -53,6 +53,7 @@ classDiagram
         +federatedProviderId: string
         +inspectFederatedSsoPage() Promise~FederatedSsoInspectionResult~
         +submitFederatedIdentifier(identifier) Promise~PageActionResult~
+        +triggerFederatedLogin() Promise~PageActionResult~
     }
 
     class FederatedAuthPageDriverPort {
@@ -79,25 +80,23 @@ export interface FederatedSsoProviderAdapterPort<TDocument = Document> {
   readonly displayName: string;
   inspectPage(doc: TDocument, loc: PageLocationSnapshot): FederatedSsoInspectionResult;
   submitIdentifier(doc: TDocument, identifier: string): PageActionResult;
+  triggerLogin(doc: TDocument): PageActionResult;
 }
 ```
 
 #### Declarative Specification Schema (`FederatedSsoProviderSpec`)
-Most SAML Service Providers follow identical patterns (email prompt -> transit -> authenticated landing). Rather than writing imperative code for each provider, providers can be defined declaratively:
+Federated Service Providers declaratively configure any of three initiation modes via plain serializable JSON (`FederatedSsoProviderSpec`) passed directly across Playwright `page.evaluate` and Chrome extension tab messages:
+- **Mode A (`identifierPrompt`)**: Email/identifier discovery prompt (`submitFederatedIdentifier`)
+- **Mode B (`loginTrigger`)**: Click-through SSO trigger button/link (`triggerFederatedLogin`)
+- **Mode C (Direct Redirect via `entryUrl`)**: Immediate HTTP 302 SAML/Shibboleth redirect through `transitHostnames` / `transitUrlSubstrings`
 
 ```ts
 export interface FederatedSsoProviderSpec {
   providerId: string;
   displayName: string;
-  identifierPrompt: {
-    hostnames: readonly string[];
-    pathnameSubstrings: readonly string[];
-    identifierInputSelector: string;
-    submitButtonSelector: string;
-    formSelector?: string;
-    contextualErrorSelector?: string;
-    forceEnableSubmitButton?: boolean;
-  };
+  entryUrl?: string;
+  identifierPrompt?: FederatedIdentifierPromptSpec;
+  loginTrigger?: FederatedLoginTriggerSpec;
   transitHostnames: readonly string[];
   transitUrlSubstrings: readonly string[];
   authenticatedHostnames: readonly string[];
@@ -228,7 +227,7 @@ export class RedisVaultStorage implements VaultStoragePort, VaultSecretMaterialP
 | Core domain decoupled from Webex | Zero Webex references in `domain/login-flow-spec.ts` | Verified |
 | ISP compliance on Driver Port | `AuthPageDriverPort` vs `FederatedAuthPageDriverPort` | Verified |
 | OCP compliance on SAML Providers | Pluggable `FederatedSsoProviderAdapterPort` & `SelectorFederatedSsoProviderAdapter` | Verified |
-| Backward compatibility maintained on adapters | `WebexSamlProviderAdapter` implements new port, helper functions intact | Verified |
+| Spec-driven federated drivers (zero legacy shims) | `WebexSamlProviderAdapter` wraps `WEBEX_SAML_FLOW_SPEC`; Playwright & Chrome drivers inject `FederatedSsoProviderSpec` directly; legacy shims purged | Verified |
 | Storage & Session Pool ISP | Segregated interfaces with composite backwards-compatible ports | Verified |
 | Typecheck across all 5 packages | 0 errors (`npm run typecheck`) | Verified |
-| Vitest test suites | 10/10 test files, 42/42 tests passing (`npm test`) | Verified |
+| Vitest test suites | 10/10 test files, 50/50 tests passing (`npm test`) | Verified |

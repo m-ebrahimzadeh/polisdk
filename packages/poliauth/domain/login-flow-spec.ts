@@ -31,13 +31,27 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
       'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376',
     onlineServicesShortcutUrl: 'https://www.polimi.it/servizi-online',
     ssoPortalServiceId: '376',
+    idpHostname: 'aunicalogin.polimi.it',
+    idpPathnameSubstring: '/aunicalogin',
+    sessionTerminatedMarker: 'SessioneTerminata',
+    sessionExpiredTextMarkers: ['violazione della sicurezza', 'sessione di lavoro'],
     sessionExpiredSelectors: {
       continueToPortalLink:
         'a.btn-primary[href*="id_servizio=376"], a[role="button"][href*="id_servizio=376"]',
+      fallbackContinueToPortalLink: 'a[href*="id_servizio=376"]',
       logoutLink: 'a[href*="mode=logout"]',
       dangerAlert: '.poli-messages .alert-danger .jaf-message',
       warningAlert: '.poli-messages .alert-warning .jaf-message'
     }
+  },
+
+  /**
+   * Intermediate SSO cookie auto-submit handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`).
+   */
+  ssoHandoffPage: {
+    formSelector:
+      'form[action*="AunicaLogin.do"], form[action*="doSSO.jsp"], form[name="form1"][action*="Aunica"]',
+    checkCookieInputSelector: 'input[name="evn_checkCookieSSO"]'
   },
 
   /**
@@ -72,6 +86,7 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
     urlSubstrings: ['IdentificazioneUnica.do', 'IdentificazioneDFA.do'],
     formSelector: 'form#form_scelta2fa, form[action*="IdentificazioneDFA.do"]',
     otpInputSelector: 'input#otp[name="otp"], input[name="otp"]',
+    fallbackOtpInputSelector: 'input#codice_otp[name="codice_otp"], input#codice_otp',
     submitButtonSelector:
       'button#submit-dissms[name="evn_continua"], button[name="evn_continua"]:not(.jaf-visually-hidden)',
     fallbackSubmitButtonSelector: 'button[name="evn_continua"]',

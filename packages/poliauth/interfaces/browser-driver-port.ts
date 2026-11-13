@@ -129,6 +129,11 @@ export interface FederatedSsoPageDriverPort {
    * identifier-discovery prompt.
    */
   submitFederatedIdentifier(identifier: string): Promise<PageActionResult>;
+
+  /**
+   * Clicks/triggers the SP's SSO login button or link without entering an identifier.
+   */
+  triggerFederatedLogin(): Promise<PageActionResult>;
 }
 
 /**

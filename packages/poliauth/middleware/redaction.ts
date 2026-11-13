@@ -32,6 +32,23 @@ export function redactSecrets(
 }
 
 /**
+ * Extracts and redacts a diagnostic message from an unknown error value.
+ */
+export function redactSensitiveErrorText(
+  error: unknown,
+  extraSecrets: string[] = [],
+  customRules: RedactionRule[] = []
+): string {
+  const raw =
+    error instanceof Error
+      ? error.message || error.name
+      : typeof error === 'string'
+        ? error
+        : String(error);
+  return redactSecrets(raw, extraSecrets, customRules);
+}
+
+/**
  * Wraps an `AuthLoggerPort` so every log message and error argument is passed through `redactSecrets`.
  */
 export function createRedactingLogger(

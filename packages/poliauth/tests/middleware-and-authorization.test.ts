@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { AuthorizationService } from '../application/authorization.js';
 import { createAuthMiddleware } from '../middleware/auth-middleware.js';
-import { redactSecrets, createRedactingLogger } from '../middleware/redaction.js';
+import {
+  redactSecrets,
+  redactSensitiveErrorText,
+  createRedactingLogger
+} from '../middleware/redaction.js';
 import { InMemoryUserIdentityRepository, InMemoryVaultStorage } from '../storage/memory-storage.js';
 import { PoliAuth } from '../src/poliauth-client.js';
 
@@ -182,6 +186,14 @@ describe('AuthorizationService, Middleware, Secret Redaction & PoliAuth Facade',
     safeLogger.info('Using API_KEY_SECRET123 and pass MyVaultPassword!');
     expect(loggedMessages[0]).toContain('[REDACTED_API_KEY]');
     expect(loggedMessages[0]).not.toContain('MyVaultPassword!');
+
+    const errMsg = redactSensitiveErrorText(
+      new Error('Failed redirect on ?SAMLResponse=SECRET_ASSERTION&__pj1=HMAC123 with SuperSecretPass'),
+      ['SuperSecretPass']
+    );
+    expect(errMsg).toContain('SAMLResponse=[REDACTED]');
+    expect(errMsg).toContain('__pj1=[REDACTED]');
+    expect(errMsg).not.toContain('SuperSecretPass');
   });
 
   it('provides a unified PoliAuth facade for credential persistence, wizard management, and logout cleanup', async () => {

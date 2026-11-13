@@ -17,11 +17,11 @@
 | Import Path | Contents |
 |---|---|
 | `@polisdk/poliauth` | Unified `PoliAuth` facade + re-exports of all core layers |
-| `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`), `TotpService`, `cleanTotpSecret`, `isValidTotpSecret`, `decodeTotpBase32`, `generateTotp`, `generateStableTotp`, `getTotpRemainingSeconds`, `TotpOptions`, `StableTotpOptions`, `StableTotpResult`, `TotpGeneratorPort`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation utilities (`normalizeCredentials`, `maskSecret`, `maskPersonCode`) |
+| `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`, `PolimiStageInspectionResult`, `FederatedSsoInspectionResult`), `TotpService`, `cleanTotpSecret`, `isValidTotpSecret`, `decodeTotpBase32`, `generateTotp`, `generateStableTotp`, `getTotpRemainingSeconds`, `TotpOptions`, `StableTotpOptions`, `StableTotpResult`, `TotpGeneratorPort`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation utilities (`normalizeCredentials`, `maskSecret`, `maskPersonCode`) |
 | `@polisdk/poliauth/application` | `PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService` |
-| `@polisdk/poliauth/interfaces` | Segregated role ports: `AuthPageDriverPort`, `PageNavigationPort`, `PolimiIdpPagePort`, `FederatedSsoPageDriverPort`, `FederatedAuthPageDriverPort`, `FederatedSsoProviderAdapterPort`, `FederatedSsoProviderResolverPort`, `FederatedSsoProviderSpec`, `VaultStoragePort`, `VaultSecretMaterialPort`, `UserVaultStorageFactoryPort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `UserIdentityProvisionerPort`, `UserIdentityReaderPort`, `UserIdentityWriterPort`, `SessionContextPoolPort`, `SessionContextLeasePort`, `SessionContextPersistencePort`, `SessionContextDisposalPort`, `SessionPoolStatsPort`, `OtpChallengeProviderPort`, `OtpCodeProviderPort`, `ManualOtpChallengePort`, `AuthorizationServicePort`, `AccessEvaluatorPort`, `SubjectRoleQueryPort`, `ResourceAuthorizerPort`, `ResourceAuthorizationPolicyPort`, `AuthLoggerPort`, `MaybePromise` |
+| `@polisdk/poliauth/interfaces` | Segregated role ports: `AuthPageDriverPort`, `PageNavigationPort`, `PolimiIdpPagePort`, `FederatedSsoPageDriverPort`, `FederatedAuthPageDriverPort`, `FederatedSsoProviderAdapterPort`, `FederatedSsoProviderResolverPort`, `FederatedSsoProviderSpec`, `FederatedIdentifierPromptSpec`, `FederatedLoginTriggerSpec`, `VaultStoragePort`, `VaultSecretMaterialPort`, `UserVaultStorageFactoryPort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `UserIdentityProvisionerPort`, `UserIdentityReaderPort`, `UserIdentityWriterPort`, `SessionContextPoolPort`, `SessionContextLeasePort`, `SessionContextPersistencePort`, `SessionContextDisposalPort`, `SessionPoolStatsPort`, `OtpChallengeProviderPort`, `OtpCodeProviderPort`, `ManualOtpChallengePort`, `AuthorizationServicePort`, `AccessEvaluatorPort`, `SubjectRoleQueryPort`, `ResourceAuthorizerPort`, `ResourceAuthorizationPolicyPort`, `AuthLoggerPort`, `MaybePromise` |
 | `@polisdk/poliauth/storage` | `EncryptedCredentialVault`, `saveEncryptedCredentials`, `loadEncryptedCredentials`, `clearEncryptedCredentials`, `saveEncryptedSessionState`, `loadEncryptedSessionState`, `clearEncryptedSessionState`, `InMemoryVaultStorage`, `InMemoryUserVaultStorageFactory`, `InMemorySessionStateStore`, `InMemoryUserIdentityRepository` |
-| `@polisdk/poliauth/adapters` | `DomAuthPageDriver`, `DomFederatedAuthPageDriver`, `polimi-dom-adapter`, `webex-sso-dom-adapter` (`WebexSamlProviderAdapter`, `WEBEX_SAML_FLOW_SPEC`), `federated-sso-dom-adapter` (`SelectorFederatedSsoProviderAdapter`, `inspectFederatedSsoPageBySpec`, `submitFederatedIdentifierBySpec`), `federated-sso-provider-registry` (`FederatedSsoProviderRegistry`, `createDefaultFederatedSsoProviderRegistry`) |
+| `@polisdk/poliauth/adapters` | `DomAuthPageDriver`, `DomFederatedAuthPageDriver`, `polimi-dom-adapter`, `webex-sso-dom-adapter` (`WebexSamlProviderAdapter`, `WEBEX_SAML_FLOW_SPEC`, `createWebexSamlFlowSpec`), `federated-sso-dom-adapter` (`SelectorFederatedSsoProviderAdapter`, `inspectFederatedSsoPageBySpec`, `isFederatedLoginTriggerPage`, `submitFederatedIdentifierBySpec`, `triggerFederatedLoginBySpec`), `federated-sso-provider-registry` (`FederatedSsoProviderRegistry`, `createDefaultFederatedSsoProviderRegistry`) |
 | `@polisdk/poliauth/middleware` | `createAuthMiddleware`, `redactSecrets`, `redactSensitiveErrorText`, `createRedactingLogger` |
 
 ---
@@ -119,4 +119,71 @@ const authMiddleware = createTelegramAuthMiddleware({
   allowedUserIds: [12345678],
   userRepository: db
 });
+```
+
+---
+
+## 6. Federated SAML 2.0 & Shibboleth SSO (Modes A, B, and C)
+
+Any federated Service Provider can be configured declaratively via `FederatedSsoProviderSpec` and passed directly at runtime to `PlaywrightAuthPageDriver` or `ChromeExtensionTabDriver` (or cloned via `.withFederatedProviderSpec(spec)`):
+
+1. **Mode A (`identifierPrompt`)**: Multi-tenant SaaS SPs (e.g., Webex via `WEBEX_SAML_FLOW_SPEC` or `createWebexSamlFlowSpec()`, Zoom) requiring `federatedIdentifier` (or `credentials.polimiEmail`).
+2. **Mode B (`loginTrigger`)**: Click-through Shibboleth/CAS landing pages (e.g., WeBeep `/login/index.php`) where `triggerFederatedLogin()` clicks `loginTrigger.triggerSelector` without entering an email.
+3. **Mode C (direct redirect via `entryUrl`)**: Direct Shibboleth endpoints (e.g., `https://webeep.polimi.it/auth/shibboleth/index.php`) that 302-redirect through `transitHostnames` / `transitUrlSubstrings` to PoliMi IdP and return to `authenticatedHostnames` / `authenticatedSelectors`.
+
+### Playwright with Mode B / Mode C `FederatedSsoProviderSpec`
+
+```ts
+import {
+  PoliAuthOrchestrator,
+  OtpChallengeCoordinator,
+  TotpService,
+  type FederatedSsoProviderSpec
+} from '@polisdk/poliauth';
+import { PlaywrightAuthPageDriver } from '@polisdk/poliauth-playwright';
+
+const webeepSpec: FederatedSsoProviderSpec = {
+  providerId: 'webeep',
+  displayName: 'PoliMi WeBeep (Moodle)',
+  entryUrl: 'https://webeep.polimi.it/login/index.php',
+  loginTrigger: {
+    hostnames: ['webeep.polimi.it'],
+    pathnameSubstrings: ['/login/index.php'],
+    triggerSelector: 'a[href*="/auth/shibboleth/index.php"]'
+  },
+  transitHostnames: ['shibidp.polimi.it', 'aunicalogin.polimi.it'],
+  transitUrlSubstrings: ['/idp/profile/SAML2/', '/Shibboleth.sso/'],
+  authenticatedHostnames: ['webeep.polimi.it'],
+  authenticatedSelectors: ['#page-my-index', '.usermenu']
+};
+
+const orchestrator = new PoliAuthOrchestrator(
+  new OtpChallengeCoordinator({ totpGenerator: new TotpService() })
+);
+
+const driver = new PlaywrightAuthPageDriver(page, {
+  federatedProviderSpec: webeepSpec
+});
+
+await orchestrator.authenticateFederatedSaml({
+  userId: 1001,
+  driver,
+  credentials,
+  entryUrl: webeepSpec.entryUrl
+});
+```
+
+### Chrome Extension MV3 with Dynamic `FederatedSsoProviderSpec`
+
+```ts
+import { WEBEX_SAML_FLOW_SPEC } from '@polisdk/poliauth/adapters';
+import { ChromeExtensionTabDriver } from '@polisdk/poliauth-chrome';
+
+// Mode A (Webex email discovery)
+const webexDriver = new ChromeExtensionTabDriver(activeTabId, {
+  federatedProviderSpec: WEBEX_SAML_FLOW_SPEC
+});
+
+// Switch spec cleanly without rebuilding bundles or changing content scripts
+const webeepDriver = webexDriver.withFederatedProviderSpec(webeepSpec);
 ```

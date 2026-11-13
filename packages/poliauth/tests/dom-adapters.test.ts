@@ -9,16 +9,21 @@ import {
   submitPolimiOtp
 } from '../adapters/polimi-dom-adapter.js';
 import {
-  isWebexEmailSsoPage,
-  inspectWebexSsoPage,
-  submitWebexEmailLogin,
+  WEBEX_SAML_FLOW_SPEC,
   WebexSamlProviderAdapter
 } from '../adapters/webex-sso-dom-adapter.js';
 import {
   FederatedSsoProviderRegistry,
-  SelectorFederatedSsoProviderAdapter
+  SelectorFederatedSsoProviderAdapter,
+  inspectFederatedSsoPageBySpec,
+  isFederatedIdentifierPromptPage,
+  isFederatedLoginTriggerPage,
+  isFederatedSsoTransitLocation,
+  submitFederatedIdentifierBySpec,
+  triggerFederatedLoginBySpec
 } from '../adapters/index.js';
 import { DomAuthPageDriver, DomFederatedAuthPageDriver } from '../adapters/dom-page-driver.js';
+import type { FederatedSsoProviderSpec } from '../interfaces/federated-sso-provider-port.js';
 
 describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
   it('detects and recovers from Stage 0 SessioneTerminata security violation page', () => {
@@ -178,7 +183,7 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     expect((await driver.inspectPolimiStage()).stage).toBe('authenticated');
   });
 
-  it('handles Federated SAML SSO email prompt and dispatches input/change/blur events to enable #IDButton2', () => {
+  it('handles Mode A identifierPrompt via WEBEX_SAML_FLOW_SPEC and dispatches input/change/blur events to enable #IDButton2', () => {
     const dom = new JSDOM(
       `<!DOCTYPE html>
       <html>
@@ -194,11 +199,12 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
 
     const doc = dom.window.document;
     const loc = dom.window.location;
-    expect(isWebexEmailSsoPage(doc, loc)).toBe(true);
-    const inspection = inspectWebexSsoPage(doc, loc);
+    expect(isFederatedIdentifierPromptPage(WEBEX_SAML_FLOW_SPEC, doc, loc)).toBe(true);
+    expect(isFederatedSsoTransitLocation(WEBEX_SAML_FLOW_SPEC, loc.href, loc.hostname)).toBe(true);
+    const inspection = inspectFederatedSsoPageBySpec(WEBEX_SAML_FLOW_SPEC, doc, loc);
     expect(inspection.status).toBe('login_required');
     expect(inspection.isIdentifierPrompt).toBe(true);
-    expect(inspection.isEmailSsoPage).toBe(true);
+    expect(inspection.isLoginTrigger).toBe(false);
     expect(inspection.providerId).toBe('webex');
 
     const eventsFired: string[] = [];
@@ -217,7 +223,11 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
       buttonClicked = true;
     });
 
-    const res = submitWebexEmailLogin(doc, ' mario.rossi@mail.polimi.it ');
+    const res = submitFederatedIdentifierBySpec(
+      WEBEX_SAML_FLOW_SPEC,
+      doc,
+      ' mario.rossi@mail.polimi.it '
+    );
     expect(res.ok).toBe(true);
     expect(emailInput.value).toBe('mario.rossi@mail.polimi.it');
     expect(eventsFired).toEqual(['input', 'change', 'blur']);
@@ -249,6 +259,7 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     expect(inspection.status).toBe('login_required');
     expect(inspection.providerId).toBe('webex');
     expect(inspection.isIdentifierPrompt).toBe(true);
+    expect(inspection.isLoginTrigger).toBe(false);
 
     let clicked = false;
     doc.querySelector<HTMLButtonElement>('#IDButton2')?.addEventListener('click', () => {
@@ -262,7 +273,7 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
   });
 
   it('proves Open/Closed Principle: plugs a custom Zoom SAML provider into DomFederatedAuthPageDriver without modifying core interfaces', async () => {
-    const customZoomSpec = {
+    const customZoomSpec: FederatedSsoProviderSpec = {
       providerId: 'zoom',
       displayName: 'Zoom',
       identifierPrompt: {
@@ -276,7 +287,7 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
       transitUrlSubstrings: ['/saml/sso'],
       authenticatedHostnames: ['zoom.us'],
       authenticatedSelectors: ['.zoom-profile-header']
-    } as const;
+    };
 
     const zoomAdapter = new SelectorFederatedSsoProviderAdapter(customZoomSpec);
     const registry = new FederatedSsoProviderRegistry([zoomAdapter]);
@@ -307,6 +318,7 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     expect(inspection.providerId).toBe('zoom');
     expect(inspection.status).toBe('login_required');
     expect(inspection.isIdentifierPrompt).toBe(true);
+    expect(inspection.isLoginTrigger).toBe(false);
 
     let clicked = false;
     dom.window.document.querySelector('#btn-continue')?.addEventListener('click', () => {
@@ -317,5 +329,144 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     expect(res.ok).toBe(true);
     expect(clicked).toBe(true);
     expect((dom.window.document.querySelector('#email') as HTMLInputElement).value).toBe('professor@polimi.it');
+  });
+
+  it('supports Mode B click-through loginTrigger Shibboleth SPs (e.g., WeBeep /login/index.php)', async () => {
+    const webeepSpec: FederatedSsoProviderSpec = {
+      providerId: 'webeep',
+      displayName: 'WeBeep',
+      entryUrl: 'https://webeep.polimi.it/login/index.php',
+      loginTrigger: {
+        hostnames: ['webeep.polimi.it'],
+        pathnameSubstrings: ['/login/index.php'],
+        triggerSelector: 'a.btn-shibboleth',
+        contextualErrorSelector: '.loginerrors .alert-danger',
+        forceEnableTrigger: true
+      },
+      transitHostnames: ['shibidp.polimi.it'],
+      transitUrlSubstrings: ['/auth/shibboleth/'],
+      authenticatedHostnames: ['webeep.polimi.it'],
+      authenticatedSelectors: ['.usermenu', '#page-my-index']
+    };
+
+    const loginDom = new JSDOM(
+      `<!DOCTYPE html>
+      <html>
+        <body>
+          <a class="btn-shibboleth" href="/auth/shibboleth/index.php" disabled>PoliMi Credentials</a>
+        </body>
+      </html>`,
+      { url: 'https://webeep.polimi.it/login/index.php' }
+    );
+
+    expect(isFederatedLoginTriggerPage(webeepSpec, loginDom.window.document, loginDom.window.location)).toBe(true);
+
+    const driver = new DomFederatedAuthPageDriver({
+      getDocument: () => loginDom.window.document,
+      getLocation: () => loginDom.window.location,
+      provider: new SelectorFederatedSsoProviderAdapter(webeepSpec)
+    });
+
+    const loginInspect = await driver.inspectFederatedSsoPage();
+    expect(loginInspect.providerId).toBe('webeep');
+    expect(loginInspect.status).toBe('login_required');
+    expect(loginInspect.isIdentifierPrompt).toBe(false);
+    expect(loginInspect.isLoginTrigger).toBe(true);
+    expect(loginInspect.isSamlTransitPage).toBe(false);
+
+    let triggerClicked = false;
+    loginDom.window.document
+      .querySelector('.btn-shibboleth')
+      ?.addEventListener('click', (e) => {
+        e.preventDefault();
+        triggerClicked = true;
+      });
+
+    const triggerRes = await driver.triggerFederatedLogin();
+    expect(triggerRes.ok).toBe(true);
+    expect(triggerClicked).toBe(true);
+
+    // Contextual error on loginTrigger page
+    const errorDom = new JSDOM(
+      `<!DOCTYPE html>
+      <html>
+        <body>
+          <div class="loginerrors"><div class="alert-danger">Invalid Shibboleth session</div></div>
+          <a class="btn-shibboleth" href="/auth/shibboleth/index.php">PoliMi Credentials</a>
+        </body>
+      </html>`,
+      { url: 'https://webeep.polimi.it/login/index.php' }
+    );
+    const errorInspect = inspectFederatedSsoPageBySpec(
+      webeepSpec,
+      errorDom.window.document,
+      errorDom.window.location
+    );
+    expect(errorInspect.status).toBe('error');
+    expect(errorInspect.isLoginTrigger).toBe(true);
+    expect(errorInspect.reason).toContain('Invalid Shibboleth session');
+
+    // Authenticated SP landing on same hostname
+    const authDom = new JSDOM(
+      `<!DOCTYPE html><html><body id="page-my-index"><div class="usermenu">Student</div></body></html>`,
+      { url: 'https://webeep.polimi.it/my/' }
+    );
+    const authInspect = inspectFederatedSsoPageBySpec(
+      webeepSpec,
+      authDom.window.document,
+      authDom.window.location
+    );
+    expect(authInspect.status).toBe('authenticated');
+    expect(authInspect.isLoginTrigger).toBe(false);
+  });
+
+  it('supports Mode C direct-redirect Shibboleth SPs without identifierPrompt or loginTrigger', () => {
+    const directSpec: FederatedSsoProviderSpec = {
+      providerId: 'career-direct',
+      displayName: 'PoliMi Career Services',
+      entryUrl: 'https://webeep.polimi.it/auth/shibboleth/index.php',
+      transitHostnames: ['shibidp.polimi.it'],
+      transitUrlSubstrings: ['/auth/shibboleth/'],
+      authenticatedHostnames: ['webeep.polimi.it']
+    };
+
+    const transitDom = new JSDOM(`<!DOCTYPE html><html><body>Redirecting...</body></html>`, {
+      url: 'https://webeep.polimi.it/auth/shibboleth/index.php'
+    });
+    const transitInspect = inspectFederatedSsoPageBySpec(
+      directSpec,
+      transitDom.window.document,
+      transitDom.window.location
+    );
+    expect(transitInspect.status).toBe('sso_in_transit');
+    expect(transitInspect.isSamlTransitPage).toBe(true);
+    expect(transitInspect.isIdentifierPrompt).toBe(false);
+    expect(transitInspect.isLoginTrigger).toBe(false);
+
+    const idpDom = new JSDOM(`<!DOCTYPE html><html><body>IdP</body></html>`, {
+      url: 'https://shibidp.polimi.it/idp/profile/SAML2/Redirect/SSO'
+    });
+    const idpInspect = inspectFederatedSsoPageBySpec(
+      directSpec,
+      idpDom.window.document,
+      idpDom.window.location
+    );
+    expect(idpInspect.status).toBe('sso_in_transit');
+    expect(idpInspect.isSamlTransitPage).toBe(true);
+
+    const authDom = new JSDOM(`<!DOCTYPE html><html><body>Dashboard</body></html>`, {
+      url: 'https://webeep.polimi.it/my/'
+    });
+    const authInspect = inspectFederatedSsoPageBySpec(
+      directSpec,
+      authDom.window.document,
+      authDom.window.location
+    );
+    expect(authInspect.status).toBe('authenticated');
+
+    expect(submitFederatedIdentifierBySpec(directSpec, authDom.window.document, 'a@polimi.it').ok).toBe(
+      false
+    );
+    expect(triggerFederatedLoginBySpec(directSpec, authDom.window.document).ok).toBe(false);
   });
 });

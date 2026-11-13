@@ -77,7 +77,7 @@ export class PoliAuth {
     this.totp = new TotpService();
     this.otpChallenge = new OtpChallengeCoordinator({ totpGenerator: this.totp });
     this.wizard = new CredentialSetupWizard();
-    this.orchestrator = new PoliAuthOrchestrator(this.otpChallenge);
+    this.orchestrator = new PoliAuthOrchestrator(this.otpChallenge, this.logger);
     this.authorization = new AuthorizationService(config.authorizationOptions);
     this.users = config.userRepository ?? new InMemoryUserIdentityRepository();
     this.sessionPool = config.sessionPool;

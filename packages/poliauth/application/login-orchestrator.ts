@@ -17,13 +17,22 @@ import type {
   FederatedAuthPageDriverPort,
   FederatedSsoPageDriverPort
 } from '../interfaces/browser-driver-port.js';
+import type { AuthLoggerPort } from '../interfaces/logger-port.js';
 import type {
   LoginProgressCallbacks,
   OtpChallengeProviderPort
 } from '../interfaces/otp-provider-port.js';
+import { createRedactingLogger, redactSensitiveErrorText } from '../middleware/redaction.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientNavigationError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|target closed|receiving end does not exist|message port closed/i.test(
+    msg
+  );
 }
 
 export interface PolimiSessionAuthRequest {
@@ -58,11 +67,21 @@ export interface FederatedSamlAuthRequest {
     | FederatedAuthPageDriverPort
     | (AuthPageDriverPort & Partial<FederatedSsoPageDriverPort>);
   credentials: Partial<LoginCredentials>;
+  /**
+   * Optional institutional identifier (e.g. `student@mail.polimi.it`) submitted on
+   * Mode A (`identifierPrompt`) SPs. Falls back to `credentials.polimiEmail`.
+   */
+  federatedIdentifier?: string;
+  /**
+   * Optional Service Provider entry URL to navigate to before polling
+   * (useful for Mode B landing pages and Mode C direct-redirect SPs).
+   */
+  entryUrl?: string;
   /** Poll interval in milliseconds. Default: 250. */
   pollIntervalMs?: number;
   /** Maximum poll iterations. Default: 180. */
   maxPollSteps?: number;
-  /** SAML transit window duration in ms after submitting email on federated SP. Default: 25_000. */
+  /** SAML transit window duration in ms after initiating SSO or entering transit. Default: 25_000. */
   ssoTransitWindowMs?: number;
   callbacks?: LoginProgressCallbacks;
   onAuthenticated?: () => void | Promise<void>;
@@ -74,8 +93,26 @@ export interface FederatedSamlAuthOutcome {
   error?: string;
 }
 
+export interface FederatedSamlFlowState {
+  submittedIdentifier: boolean;
+  triggeredLogin: boolean;
+  ssoTransitDeadline: number;
+  seenSamlCredentialsStep: boolean;
+  submittedSamlCredentialsCount: number;
+  submittedSamlAutoTotpCount: number;
+  submittedSamlManualOtpCount: number;
+  explicitOtpToConsume?: string;
+}
+
 export class PoliAuthOrchestrator {
-  constructor(private readonly otpCoordinator: OtpChallengeProviderPort) {}
+  private readonly logger?: AuthLoggerPort;
+
+  constructor(
+    private readonly otpCoordinator: OtpChallengeProviderPort,
+    logger?: AuthLoggerPort
+  ) {
+    this.logger = logger ? createRedactingLogger(logger) : undefined;
+  }
 
   /**
    * Executes the Politecnico di Milano SSO + 2FA authentication state machine
@@ -102,7 +139,13 @@ export class PoliAuthOrchestrator {
     try {
       const initialStage = await driver
         .inspectPolimiStage()
-        .catch(() => ({ stage: 'unknown' as const, url: '', title: '' }));
+        .catch((err) => {
+          this.logger?.debug(
+            'Initial PoliMi stage inspection interrupted; proceeding to login entry URL.',
+            redactSensitiveErrorText(err)
+          );
+          return { stage: 'unknown' as const, url: '', title: '' };
+        });
 
       if (initialStage.stage === 'authenticated') {
         await onAuthenticated?.();
@@ -123,7 +166,16 @@ export class PoliAuthOrchestrator {
       let explicitOtpToConsume = credentials.otp?.trim() || '';
 
       for (let step = 0; step < maxSteps; step++) {
-        const stageInfo = await driver.inspectPolimiStage().catch(() => null);
+        const stageInfo = await driver.inspectPolimiStage().catch((err) => {
+          if (isTransientNavigationError(err)) {
+            this.logger?.debug(
+              'Transient error inspecting PoliMi stage; retrying.',
+              redactSensitiveErrorText(err)
+            );
+            return null;
+          }
+          throw err;
+        });
 
         if (!stageInfo) {
           await sleep(pollDelayMs);
@@ -246,113 +298,212 @@ export class PoliAuthOrchestrator {
       await notify('failed', timeoutMsg);
       return { ok: false, status: 'failed', error: timeoutMsg };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = redactSensitiveErrorText(err);
+      this.logger?.error(`PoliMi authentication failed: ${msg}`);
       await notify('failed', msg);
       return { ok: false, status: 'failed', error: msg };
     }
   }
 
   /**
-   * Handles a single step of Federated SAML SSO across an SP and PoliMi IdP.
+   * Handles a single step of Federated SAML/Shibboleth SSO across an SP (Mode A identifier prompt,
+   * Mode B click-through login trigger, or Mode C direct redirect) and the PoliMi IdP.
    */
   public async handleFederatedSamlStep(params: {
     userId: IdentityId;
     driver:
-    | FederatedAuthPageDriverPort
-    | (AuthPageDriverPort & Partial<FederatedSsoPageDriverPort>);
+      | FederatedAuthPageDriverPort
+      | (AuthPageDriverPort & Partial<FederatedSsoPageDriverPort>);
     credentials: Partial<LoginCredentials>;
-    state: {
-      submittedEmail: boolean;
-      ssoTransitDeadline: number;
-      seenSamlCredentialsStep: boolean;
-      submittedSamlCredentialsCount: number;
-      submittedSamlAutoTotpCount: number;
-    };
+    federatedIdentifier?: string;
+    state: FederatedSamlFlowState;
     ssoTransitWindowMs?: number;
     callbacks?: LoginProgressCallbacks;
   }): Promise<
     | { action: 'continue_polling' }
     | { action: 'authenticated_or_ready' }
     | { action: 'login_required'; reason: string }
+    | { action: 'failed'; reason: string }
   > {
     const {
       userId,
       driver,
       credentials,
+      federatedIdentifier,
       state,
       ssoTransitWindowMs = 25_000,
       callbacks
     } = params;
 
-    const polimiStage = await driver.inspectPolimiStage().catch(() => null);
+    let polimiStage = null;
+    try {
+      polimiStage = await driver.inspectPolimiStage();
+    } catch (err) {
+      if (isTransientNavigationError(err)) {
+        this.logger?.debug(
+          'Transient error inspecting PoliMi stage during SAML SSO; retrying.',
+          redactSensitiveErrorText(err)
+        );
+        return { action: 'continue_polling' };
+      }
+      const reason = redactSensitiveErrorText(err);
+      this.logger?.error(`PoliMi stage inspection failed during SAML SSO: ${reason}`);
+      return { action: 'failed', reason };
+    }
 
-    // 1. Intermediate PoliMi SSO handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`)
-    if (polimiStage && polimiStage.stage === 'sso_handoff') {
+    // 1. PoliMi expired session / security violation recovery during SAML SSO
+    if (polimiStage && polimiStage.stage === 'session_expired') {
+      state.ssoTransitDeadline = Math.max(
+        state.ssoTransitDeadline,
+        Date.now() + ssoTransitWindowMs
+      );
+      await callbacks?.onStatusChange?.(
+        'recovering_session',
+        'Recovering expired PoliMi session...'
+      );
+      await driver.recoverSessionPage();
       return { action: 'continue_polling' };
     }
 
-    // 2. PoliMi credentials form encountered during SAML SSO
+    // 2. Intermediate PoliMi SSO handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`)
+    if (polimiStage && polimiStage.stage === 'sso_handoff') {
+      state.ssoTransitDeadline = Math.max(
+        state.ssoTransitDeadline,
+        Date.now() + ssoTransitWindowMs
+      );
+      return { action: 'continue_polling' };
+    }
+
+    // 3. PoliMi credentials form encountered during SAML SSO
     if (polimiStage && polimiStage.stage === 'credentials') {
+      state.ssoTransitDeadline = Math.max(
+        state.ssoTransitDeadline,
+        Date.now() + ssoTransitWindowMs
+      );
+
       if (!state.seenSamlCredentialsStep) {
         state.seenSamlCredentialsStep = true;
         return { action: 'continue_polling' };
       }
 
-      if (
-        credentials.personCode &&
-        credentials.password &&
-        state.submittedSamlCredentialsCount < 2
-      ) {
-        state.submittedSamlCredentialsCount += 1;
-        const credRes = await driver.submitCredentials({
-          personCode: credentials.personCode,
-          password: credentials.password,
-          stayConnected: true
-        });
-        if (!credRes.ok) {
-          return {
-            action: 'login_required',
-            reason:
-              credRes.error ||
-              'Failed to submit PoliMi credentials during SAML SSO.'
-          };
-        }
-        return { action: 'continue_polling' };
+      if (state.submittedSamlCredentialsCount > 0 && polimiStage.errorMessage) {
+        return {
+          action: 'login_required',
+          reason: `PoliMi login rejected: ${polimiStage.errorMessage}`
+        };
       }
-    }
 
-    // 3. PoliMi 2FA OTP prompt encountered during SAML SSO
-    if (polimiStage && polimiStage.stage === 'otp') {
-      const otpChoice = await this.otpCoordinator.obtainOtpCodeForUser(
-        userId,
-        credentials.totpSecret,
-        state.submittedSamlAutoTotpCount === 0,
-        callbacks
-      );
-      if (otpChoice.usedAutoTotp) {
-        state.submittedSamlAutoTotpCount += 1;
-      }
-      const otpRes = await driver.submitOtp({ otp: otpChoice.otp });
-      if (!otpRes.ok) {
+      if (state.submittedSamlCredentialsCount >= 2) {
         return {
           action: 'login_required',
           reason:
-            otpRes.error || 'Failed to submit 2FA OTP during SAML SSO.'
+            polimiStage.errorMessage ||
+            'PoliMi login remained on credentials page after submission.'
+        };
+      }
+
+      const personCode = credentials.personCode?.trim() || '';
+      const password = credentials.password || '';
+      if (!personCode || !password) {
+        return {
+          action: 'login_required',
+          reason:
+            'Person Code and Password are required to sign in on aunicalogin.polimi.it.'
+        };
+      }
+
+      state.submittedSamlCredentialsCount += 1;
+      await callbacks?.onStatusChange?.(
+        'submitting_credentials',
+        'Submitting PoliMi credentials...'
+      );
+      const credRes = await driver.submitCredentials({
+        personCode,
+        password,
+        stayConnected: true
+      });
+      if (!credRes.ok) {
+        return {
+          action: 'login_required',
+          reason:
+            credRes.error ||
+            'Failed to submit PoliMi credentials during SAML SSO.'
         };
       }
       return { action: 'continue_polling' };
     }
 
-    // 4. Check Federated SSO state
+    // 4. PoliMi 2FA OTP prompt encountered during SAML SSO
+    if (polimiStage && polimiStage.stage === 'otp') {
+      state.ssoTransitDeadline = Math.max(
+        state.ssoTransitDeadline,
+        Date.now() + ssoTransitWindowMs
+      );
+
+      if (state.submittedSamlManualOtpCount > 0 && polimiStage.errorMessage) {
+        return {
+          action: 'login_required',
+          reason: `PoliMi 2FA OTP rejected: ${polimiStage.errorMessage}`
+        };
+      }
+
+      let otpToSubmit = '';
+      const pendingExplicitOtp = state.explicitOtpToConsume?.trim() || '';
+      if (pendingExplicitOtp) {
+        otpToSubmit = pendingExplicitOtp;
+        state.explicitOtpToConsume = '';
+        state.submittedSamlManualOtpCount += 1;
+      } else {
+        const otpChoice = await this.otpCoordinator.obtainOtpCodeForUser(
+          userId,
+          credentials.totpSecret,
+          state.submittedSamlAutoTotpCount === 0,
+          callbacks
+        );
+        otpToSubmit = otpChoice.otp;
+        if (otpChoice.usedAutoTotp) {
+          state.submittedSamlAutoTotpCount += 1;
+        } else {
+          state.submittedSamlManualOtpCount += 1;
+        }
+      }
+
+      await callbacks?.onStatusChange?.('submitting_otp', 'Submitting 6-digit 2FA code...');
+      const otpRes = await driver.submitOtp({ otp: otpToSubmit });
+      if (!otpRes.ok) {
+        return {
+          action: 'login_required',
+          reason: otpRes.error || 'Failed to submit 2FA OTP during SAML SSO.'
+        };
+      }
+      return { action: 'continue_polling' };
+    }
+
+    // 5. Check Federated SP SSO state
     const fedDriver = driver as Partial<FederatedSsoPageDriverPort>;
     if (!fedDriver.inspectFederatedSsoPage) {
       return {
-        action: 'login_required',
+        action: 'failed',
         reason: 'Driver does not support federated SSO page inspection.'
       };
     }
 
-    const ssoInspection = await fedDriver.inspectFederatedSsoPage().catch(() => null);
+    let ssoInspection = null;
+    try {
+      ssoInspection = await fedDriver.inspectFederatedSsoPage();
+    } catch (err) {
+      if (isTransientNavigationError(err)) {
+        this.logger?.debug(
+          'Transient error inspecting federated SSO page; retrying.',
+          redactSensitiveErrorText(err)
+        );
+        return { action: 'continue_polling' };
+      }
+      const reason = redactSensitiveErrorText(err);
+      this.logger?.error(`Federated SSO inspection failed: ${reason}`);
+      return { action: 'failed', reason };
+    }
+
     if (!ssoInspection) {
       return { action: 'continue_polling' };
     }
@@ -361,57 +512,84 @@ export class PoliAuthOrchestrator {
       return { action: 'authenticated_or_ready' };
     }
 
-    const isPrompt =
-      ssoInspection.isIdentifierPrompt ||
-      Boolean((ssoInspection as unknown as { isEmailSsoPage?: boolean }).isEmailSsoPage);
+    if (ssoInspection.status === 'error') {
+      return {
+        action: 'login_required',
+        reason: ssoInspection.reason || 'Federated SSO reported an error.'
+      };
+    }
 
-    if (isPrompt && !state.submittedEmail) {
-      const email = (credentials.polimiEmail || '').trim();
-      if (!email) {
+    // Mode A: SP presents an identifier-discovery (email / username) prompt
+    if (ssoInspection.isIdentifierPrompt && !state.submittedIdentifier) {
+      const identifier = (federatedIdentifier ?? credentials.polimiEmail ?? '').trim();
+      if (!identifier) {
         return {
           action: 'login_required',
-          reason:
-            'Federated SAML SSO requires your PoliMi email (@mail.polimi.it).'
+          reason: `Federated SAML SSO (${ssoInspection.providerId}) requires a federatedIdentifier (or credentials.polimiEmail), but none was provided.`
         };
       }
 
-      const submitFn =
-        fedDriver.submitFederatedIdentifier ??
-        (fedDriver as unknown as { submitFederatedEmailLogin?: (email: string) => Promise<{ ok: boolean; error?: string }> }).submitFederatedEmailLogin;
-
-      if (!submitFn) {
+      if (!fedDriver.submitFederatedIdentifier) {
         return {
-          action: 'login_required',
+          action: 'failed',
           reason: 'Driver does not support federated SSO identifier submission.'
         };
       }
 
-      state.submittedEmail = true;
+      state.submittedIdentifier = true;
       state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
-      const submitRes = await submitFn.call(fedDriver, email);
+      const submitRes = await fedDriver.submitFederatedIdentifier(identifier);
       if (!submitRes.ok) {
         return {
           action: 'login_required',
-          reason: submitRes.error || 'Failed to submit federated SSO email.'
+          reason: submitRes.error || 'Failed to submit federated SSO identifier.'
         };
       }
       return { action: 'continue_polling' };
     }
 
-    if (state.submittedEmail && Date.now() < state.ssoTransitDeadline) {
+    // Mode B: SP presents a click-through SSO login trigger (no email prompt required)
+    if (ssoInspection.isLoginTrigger && !state.triggeredLogin) {
+      if (!fedDriver.triggerFederatedLogin) {
+        return {
+          action: 'failed',
+          reason: 'Driver does not support federated SSO login trigger.'
+        };
+      }
+
+      state.triggeredLogin = true;
+      state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
+      const triggerRes = await fedDriver.triggerFederatedLogin();
+      if (!triggerRes.ok) {
+        return {
+          action: 'login_required',
+          reason: triggerRes.error || 'Failed to trigger federated SSO login.'
+        };
+      }
       return { action: 'continue_polling' };
+    }
+
+    // Mode C / SAML transit polling window
+    if (
+      ssoInspection.status === 'sso_in_transit' &&
+      (ssoInspection.isSamlTransitPage || state.submittedIdentifier || state.triggeredLogin)
+    ) {
+      if (state.ssoTransitDeadline === 0) {
+        state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
+      }
+      if (Date.now() < state.ssoTransitDeadline) {
+        return { action: 'continue_polling' };
+      }
     }
 
     return {
       action: 'login_required',
-      reason:
-        ssoInspection.reason ||
-        'Federated SSO authentication required.'
+      reason: ssoInspection.reason || 'Federated SSO authentication required.'
     };
   }
 
   /**
-   * Loops `handleFederatedSamlStep` across multi-hop SAML redirects until authenticated or failed.
+   * Loops `handleFederatedSamlStep` across multi-hop SAML/Shibboleth redirects until authenticated or failed.
    */
   public async authenticateFederatedSaml(
     req: FederatedSamlAuthRequest
@@ -420,6 +598,8 @@ export class PoliAuthOrchestrator {
       userId,
       driver,
       credentials,
+      federatedIdentifier,
+      entryUrl,
       pollIntervalMs = 250,
       maxPollSteps = 180,
       ssoTransitWindowMs = 25_000,
@@ -427,46 +607,103 @@ export class PoliAuthOrchestrator {
       onAuthenticated
     } = req;
 
-    const state = {
-      submittedEmail: false,
-      ssoTransitDeadline: 0,
-      seenSamlCredentialsStep: false,
-      submittedSamlCredentialsCount: 0,
-      submittedSamlAutoTotpCount: 0
-    };
+    try {
+      if (entryUrl) {
+        const fedDriver = driver as Partial<FederatedSsoPageDriverPort>;
+        if (fedDriver.inspectFederatedSsoPage) {
+          const initialSso = await fedDriver.inspectFederatedSsoPage().catch((err) => {
+            if (isTransientNavigationError(err)) {
+              this.logger?.debug(
+                'Transient error on initial federated SSO check; navigating to entry URL.',
+                redactSensitiveErrorText(err)
+              );
+              return null;
+            }
+            throw err;
+          });
+          if (initialSso?.status === 'authenticated') {
+            await onAuthenticated?.();
+            await callbacks?.onStatusChange?.(
+              'authenticated',
+              'Authenticated on federated SP session.'
+            );
+            return { ok: true, status: 'authenticated' };
+          }
+        }
 
-    for (let step = 0; step < maxPollSteps; step++) {
-      const res = await this.handleFederatedSamlStep({
-        userId,
-        driver,
-        credentials,
-        state,
-        ssoTransitWindowMs,
-        callbacks
-      });
-
-      if (res.action === 'authenticated_or_ready') {
-        await onAuthenticated?.();
-        return { ok: true, status: 'authenticated' };
+        await callbacks?.onStatusChange?.('opening_login', 'Opening federated SSO login...');
+        await driver.goto(entryUrl);
       }
 
-      if (res.action === 'login_required') {
-        return {
-          ok: false,
-          status: 'waiting_for_login',
-          error: res.reason
-        };
+      const state: FederatedSamlFlowState = {
+        submittedIdentifier: false,
+        triggeredLogin: false,
+        ssoTransitDeadline: 0,
+        seenSamlCredentialsStep: false,
+        submittedSamlCredentialsCount: 0,
+        submittedSamlAutoTotpCount: 0,
+        submittedSamlManualOtpCount: 0,
+        explicitOtpToConsume: credentials.otp?.trim() || ''
+      };
+
+      for (let step = 0; step < maxPollSteps; step++) {
+        const res = await this.handleFederatedSamlStep({
+          userId,
+          driver,
+          credentials,
+          federatedIdentifier,
+          state,
+          ssoTransitWindowMs,
+          callbacks
+        });
+
+        if (res.action === 'authenticated_or_ready') {
+          await onAuthenticated?.();
+          await callbacks?.onStatusChange?.(
+            'authenticated',
+            'Authenticated on federated SP session.'
+          );
+          return { ok: true, status: 'authenticated' };
+        }
+
+        if (res.action === 'failed') {
+          await callbacks?.onStatusChange?.('failed', res.reason);
+          return {
+            ok: false,
+            status: 'failed',
+            error: res.reason
+          };
+        }
+
+        if (res.action === 'login_required') {
+          return {
+            ok: false,
+            status: 'waiting_for_login',
+            error: res.reason
+          };
+        }
+
+        if (pollIntervalMs > 0) {
+          await sleep(pollIntervalMs);
+        }
       }
 
-      if (pollIntervalMs > 0) {
-        await sleep(pollIntervalMs);
-      }
+      const timeoutMsg = 'Timed out waiting for federated SAML SSO completion.';
+      await callbacks?.onStatusChange?.('failed', timeoutMsg);
+      return {
+        ok: false,
+        status: 'failed',
+        error: timeoutMsg
+      };
+    } catch (err) {
+      const msg = redactSensitiveErrorText(err);
+      this.logger?.error(`Federated SAML authentication failed: ${msg}`);
+      await callbacks?.onStatusChange?.('failed', msg);
+      return {
+        ok: false,
+        status: 'failed',
+        error: msg
+      };
     }
-
-    return {
-      ok: false,
-      status: 'failed',
-      error: 'Timed out waiting for federated SAML SSO completion.'
-    };
   }
 }

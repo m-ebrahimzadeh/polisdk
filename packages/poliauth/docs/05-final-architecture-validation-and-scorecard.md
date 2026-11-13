@@ -221,15 +221,20 @@ sequenceDiagram
   participant SP as Federated SAML SP (Webex / Zoom / etc.)
   participant IdP as PoliMi SAML IdP (shibidp.polimi.it)
 
-  User->>Orch: authenticateFederatedSaml({ userId, driver, credentials })
+  User->>Orch: authenticateFederatedSaml({ userId, driver, credentials, federatedIdentifier, entryUrl })
   Orch->>Driver: inspectFederatedSsoPage()
-  Driver->>SP: Check identifier prompt selector
-  SP-->>Driver: Return isIdentifierPrompt: true
-
-  Note over Orch,Driver: Submit Institutional Identifier
-  Orch->>Driver: submitFederatedIdentifier('student@mail.polimi.it')
-  Driver->>SP: Fill email input, dispatch input/change/blur, click submit
-  SP-->>Driver: SAML 302 redirect to PoliMi IdP
+  alt Mode A: identifierPrompt
+    Driver-->>Orch: isIdentifierPrompt = true
+    Orch->>Driver: submitFederatedIdentifier(identifier)
+    Driver->>SP: Fill identifier input & submit form
+  else Mode B: loginTrigger
+    Driver-->>Orch: isLoginTrigger = true
+    Orch->>Driver: triggerFederatedLogin()
+    Driver->>SP: Click SSO trigger button or link
+  else Mode C: direct redirect entryUrl
+    Driver-->>Orch: status = sso_in_transit, isSamlTransitPage = true
+  end
+  SP-->>IdP: SAML 302 redirect to PoliMi IdP
 
   Note over Orch,IdP: Multi-Hop PoliMi IdP Authentication
   Orch->>Driver: inspectPolimiStage()
@@ -292,8 +297,8 @@ packages/
 - **Private Channel Enforcement**: `AuthorizationService` rejects requests originating in public or group channels by default to prevent accidental credential leakage in multi-user chats.
 
 ### 6.3 Browser Automation Resilience
-- **Zero Runtime Code Generation**: `@polisdk/poliauth-playwright` compiles its in-browser DOM injection bundle at build time using esbuild. The runtime has zero `node:fs` or `esbuild` dependencies.
-- **Transient Context Destruction Guard**: Both `PlaywrightAuthPageDriver` and `ensureAuthAdaptersInjected` catch transient `"Execution context was destroyed"` errors during multi-hop HTTP 302 redirects and auto-submitting SAML assertion forms.
+- **Zero Runtime Code Generation & Dynamic Spec Injection**: `@polisdk/poliauth-playwright` compiles its in-browser DOM injection bundle at build time using esbuild (zero runtime `node:fs` or `esbuild` dependencies), exposing generic `federatedSso` spec-driven evaluators (`*BySpec`) alongside `@polisdk/poliauth-chrome` content script message handlers that accept arbitrary serialized `FederatedSsoProviderSpec` payloads at runtime without rebuilding bundles.
+- **Transient Context Destruction Guard & Logged Retries**: `PoliAuthOrchestrator`, `PlaywrightAuthPageDriver`, `ensureAuthAdaptersInjected`, and `ChromeExtensionTabDriver` catch transient `"Execution context was destroyed"` and navigation race errors during multi-hop HTTP 302 redirects, log redacted diagnostics via `AuthLoggerPort` + `redactSensitiveErrorText`, and retry deterministically with zero silent failures.
 - **Resource Management**: `PlaywrightBrowserSessionPool` guarantees LRU eviction of idle contexts, reference-counted locking during concurrent use, and background timer unreferencing (`unrefTimerIfSupported`) so background tasks do not block process termination.
 
 ---
@@ -322,7 +327,7 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 | :--- | :---: | :---: | :--- |
 | **Modularity** | `3/10` | **`10/10`** | Monolithic codebase decomposed into 5 cleanly bounded packages. `@polisdk/poliauth` has zero runtime dependencies and can run in any modern JS engine. |
 | **Reusability** | `2/10` | **`10/10`** | Pure domain models, TOTP algorithms, and DOM adapters can be embedded in browser extensions, desktop apps, servers, or CLI tools without dragging in SQLite or Playwright. |
-| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 42 automated tests pass across 10 suites in <4 seconds. |
+| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 50 automated tests pass across 10 test files. |
 | **Extensibility** | `4/10` | **`10/10`** | Pluggable SPI for federated SAML providers (`FederatedSsoProviderAdapterPort`), declarative JSON specs, pluggable storage adapters (`VaultStoragePort`), and custom resource authorization policies. |
 | **Clean Architecture Compliance** | `2/10` | **`10/10`** | Strict inward dependency direction. Domain has zero external imports. Ports and adapters completely abstract all I/O, database, and browser mechanics. Authentication stops strictly at `'authenticated'`. |
 
@@ -333,5 +338,5 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 ```text
 ✅ Build:     npm run build     --> 5/5 packages compiled cleanly
 ✅ Typecheck: npm run typecheck --> 0 errors across entire workspace
-✅ Tests:     npm test          --> 10/10 test files passed, 42/42 tests passing
+✅ Tests:     npm test          --> 10/10 test files passed, 50/50 tests passing
 ```

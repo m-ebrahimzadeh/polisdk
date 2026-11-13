@@ -94,7 +94,7 @@ export type FederatedSsoStatus =
  * Provider-neutral classification of the current page during a federated SAML SSO flow.
  */
 export interface FederatedSsoInspectionResult {
-  /** Identifier of the federated SSO provider adapter that produced this result (e.g. `'webex'`). */
+  /** Identifier of the federated SSO provider adapter that produced this result (e.g. `'webex'`, `'webeep'`). */
   providerId: string;
   status: FederatedSsoStatus;
   /**
@@ -102,8 +102,11 @@ export interface FederatedSsoInspectionResult {
    * username) that must be submitted before the SP redirects to the PoliMi IdP.
    */
   isIdentifierPrompt: boolean;
-  /** Optional alias for isIdentifierPrompt for backward compatibility. */
-  isEmailSsoPage?: boolean;
+  /**
+   * `true` when the SP renders a click-through SSO login trigger button or link
+   * that initiates the SAML/Shibboleth redirect without requiring an email prompt.
+   */
+  isLoginTrigger: boolean;
   /** `true` while the browser is on SP/IdP SAML redirect or assertion endpoints. */
   isSamlTransitPage: boolean;
   url: string;

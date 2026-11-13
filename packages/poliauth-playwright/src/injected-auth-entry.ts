@@ -5,10 +5,12 @@ import {
   recoverPolimiSessionPage,
   submitPolimiCredentials,
   submitPolimiOtp,
-  isWebexOrPolimiSsoTransitUrl,
-  isWebexEmailSsoPage,
-  inspectWebexSsoPage,
-  submitWebexEmailLogin
+  isFederatedSsoTransitLocation,
+  isFederatedIdentifierPromptPage,
+  isFederatedLoginTriggerPage,
+  inspectFederatedSsoPageBySpec,
+  submitFederatedIdentifierBySpec,
+  triggerFederatedLoginBySpec
 } from '@polisdk/poliauth/adapters';
 
 export interface InjectedPoliAuthAdapters {
@@ -20,11 +22,13 @@ export interface InjectedPoliAuthAdapters {
     submitPolimiCredentials: typeof submitPolimiCredentials;
     submitPolimiOtp: typeof submitPolimiOtp;
   };
-  webexSso: {
-    isWebexOrPolimiSsoTransitUrl: typeof isWebexOrPolimiSsoTransitUrl;
-    isWebexEmailSsoPage: typeof isWebexEmailSsoPage;
-    inspectWebexSsoPage: typeof inspectWebexSsoPage;
-    submitWebexEmailLogin: typeof submitWebexEmailLogin;
+  federatedSso: {
+    isFederatedSsoTransitLocation: typeof isFederatedSsoTransitLocation;
+    isFederatedIdentifierPromptPage: typeof isFederatedIdentifierPromptPage;
+    isFederatedLoginTriggerPage: typeof isFederatedLoginTriggerPage;
+    inspectFederatedSsoPageBySpec: typeof inspectFederatedSsoPageBySpec;
+    submitFederatedIdentifierBySpec: typeof submitFederatedIdentifierBySpec;
+    triggerFederatedLoginBySpec: typeof triggerFederatedLoginBySpec;
   };
 }
 
@@ -44,11 +48,13 @@ if (typeof window !== 'undefined') {
       submitPolimiCredentials,
       submitPolimiOtp
     },
-    webexSso: {
-      isWebexOrPolimiSsoTransitUrl,
-      isWebexEmailSsoPage,
-      inspectWebexSsoPage,
-      submitWebexEmailLogin
+    federatedSso: {
+      isFederatedSsoTransitLocation,
+      isFederatedIdentifierPromptPage,
+      isFederatedLoginTriggerPage,
+      inspectFederatedSsoPageBySpec,
+      submitFederatedIdentifierBySpec,
+      triggerFederatedLoginBySpec
     }
   };
 }

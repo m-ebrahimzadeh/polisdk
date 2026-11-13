@@ -148,14 +148,19 @@ export class DomAuthPageDriver implements AuthPageDriverPort {
     return this.options.federatedProvider.submitIdentifier(this.getDocument(), identifier);
   }
 
-  async submitFederatedEmailLogin(email: string): Promise<PageActionResult> {
-    return this.submitFederatedIdentifier(email);
+  async triggerFederatedLogin(): Promise<PageActionResult> {
+    if (!this.options.federatedProvider) {
+      throw new Error(
+        'Federated SSO provider is not configured on this DomAuthPageDriver. Pass options.federatedProvider or use withFederatedProvider().'
+      );
+    }
+    return this.options.federatedProvider.triggerLogin(this.getDocument());
   }
 }
 
 /**
  * Direct DOM implementation of `FederatedAuthPageDriverPort`: PoliMi IdP driving plus
- * a pluggable `FederatedSsoProviderAdapterPort` (Webex, Zoom, GitLab, ...).
+ * a pluggable `FederatedSsoProviderAdapterPort` (Webex, Zoom, WeBeep, GitLab, ...).
  */
 export class DomFederatedAuthPageDriver
   extends DomAuthPageDriver
@@ -178,5 +183,9 @@ export class DomFederatedAuthPageDriver
 
   async submitFederatedIdentifier(identifier: string): Promise<PageActionResult> {
     return this.provider.submitIdentifier(this.getDocument(), identifier);
+  }
+
+  async triggerFederatedLogin(): Promise<PageActionResult> {
+    return this.provider.triggerLogin(this.getDocument());
   }
 }

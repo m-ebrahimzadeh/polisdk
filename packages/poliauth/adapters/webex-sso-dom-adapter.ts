@@ -6,19 +6,8 @@
  * Nothing in the core domain, ports, or orchestrator references Webex.
  */
 
-import type { FederatedSsoInspectionResult } from '../domain/entities.js';
-import type {
-  PageActionResult,
-  PageLocationSnapshot
-} from '../interfaces/browser-driver-port.js';
 import type { FederatedSsoProviderSpec } from '../interfaces/federated-sso-provider-port.js';
-import {
-  SelectorFederatedSsoProviderAdapter,
-  inspectFederatedSsoPageBySpec,
-  isFederatedIdentifierPromptPage,
-  isFederatedSsoTransitLocation,
-  submitFederatedIdentifierBySpec
-} from './federated-sso-dom-adapter.js';
+import { SelectorFederatedSsoProviderAdapter } from './federated-sso-dom-adapter.js';
 
 /**
  * Specification of the Webex SAML SSO email discovery flow
@@ -62,7 +51,7 @@ export interface WebexSamlProviderOptions {
 /**
  * Builds a (JSON-serialisable) Webex spec, optionally extended with custom
  * authenticated-page selectors. Pass the result to remote drivers such as
- * `PlaywrightFederatedAuthPageDriver`.
+ * `PlaywrightAuthPageDriver` or `ChromeExtensionTabDriver`.
  */
 export function createWebexSamlFlowSpec(
   options: WebexSamlProviderOptions = {}
@@ -90,38 +79,4 @@ export class WebexSamlProviderAdapter extends SelectorFederatedSsoProviderAdapte
   constructor(options: WebexSamlProviderOptions = {}) {
     super(createWebexSamlFlowSpec(options));
   }
-}
-
-/**
- * Checks whether a URL/hostname is currently on a Webex or PoliMi SAML SSO transit endpoint.
- */
-export function isWebexOrPolimiSsoTransitUrl(url: string, hostname = ''): boolean {
-  return isFederatedSsoTransitLocation(WEBEX_SAML_FLOW_SPEC, url, hostname);
-}
-
-/**
- * Checks whether the current DOM and URL correspond to the Webex SAML SSO email prompt
- * (`idbroker-eu.webex.com/idb/saml2/jsp/doSSO.jsp` or `signin.webex.com`).
- */
-export function isWebexEmailSsoPage(doc: Document, loc: PageLocationSnapshot): boolean {
-  return isFederatedIdentifierPromptPage(WEBEX_SAML_FLOW_SPEC, doc, loc);
-}
-
-/**
- * Inspects a Webex or PoliMi SAML SSO page and classifies its federated SSO state.
- */
-export function inspectWebexSsoPage(
-  doc: Document,
-  loc: PageLocationSnapshot,
-  options?: WebexSamlProviderOptions
-): FederatedSsoInspectionResult {
-  return inspectFederatedSsoPageBySpec(createWebexSamlFlowSpec(options), doc, loc);
-}
-
-/**
- * Submits the user's institutional `@mail.polimi.it` / `@polimi.it` email on the Webex
- * SAML SSO identity broker, preserving the `#IDToken1` / `#IDButton2` enable invariant.
- */
-export function submitWebexEmailLogin(doc: Document, email: string): PageActionResult {
-  return submitFederatedIdentifierBySpec(WEBEX_SAML_FLOW_SPEC, doc, email);
 }

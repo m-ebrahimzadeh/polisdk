@@ -31,9 +31,9 @@ export function isPolimiLoginPage(doc: Document, loc: PageLocationSnapshot): boo
   }
 
   if (
-    loc.hostname.includes('aunicalogin.polimi.it') ||
-    loc.pathname.includes('/aunicalogin') ||
-    loc.pathname.includes('SessioneTerminata')
+    loc.hostname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpHostname) ||
+    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpPathnameSubstring) ||
+    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker)
   ) {
     return true;
   }
@@ -95,10 +95,11 @@ export function inspectPolimiPageStage(
     POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.continueToPortalLink
   );
   if (
-    loc.pathname.includes('SessioneTerminata') ||
-    bodyText.includes('violazione della sicurezza') ||
-    bodyText.includes('sessione di lavoro') ||
-    (continueLink && loc.hostname.includes('aunicalogin.polimi.it'))
+    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker) ||
+    POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredTextMarkers.some((marker) =>
+      bodyText.includes(marker)
+    ) ||
+    (continueLink && loc.hostname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpHostname))
   ) {
     return {
       stage: 'session_expired',
@@ -109,9 +110,9 @@ export function inspectPolimiPageStage(
   }
 
   // 2. Stage 2: 2FA OTP Input Page
-  const otpInput = doc.querySelector<HTMLInputElement>(
-    POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector
-  );
+  const otpInput =
+    doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector) ??
+    doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackOtpInputSelector);
   if (otpInput) {
     return {
       stage: 'otp',
@@ -126,9 +127,11 @@ export function inspectPolimiPageStage(
   // the SSO auto-submit form (`AunicaLogin.do`) and a hidden `#login`/`#password`
   // form while an SSO cookie is already active.
   const ssoForm = doc.querySelector<HTMLFormElement>(
-    'form[action*="AunicaLogin.do"], form[action*="doSSO.jsp"], form[name="form1"][action*="Aunica"]'
+    POLIMI_LOGIN_FLOW_SPEC.ssoHandoffPage.formSelector
   );
-  const checkCookieBtn = doc.querySelector<HTMLElement>('input[name="evn_checkCookieSSO"]');
+  const checkCookieBtn = doc.querySelector<HTMLElement>(
+    POLIMI_LOGIN_FLOW_SPEC.ssoHandoffPage.checkCookieInputSelector
+  );
   if (ssoForm || checkCookieBtn) {
     return {
       stage: 'sso_handoff',
@@ -180,7 +183,10 @@ export function recoverPolimiSessionPage(doc: Document): {
   const continueLink =
     doc.querySelector<HTMLAnchorElement>(
       POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.continueToPortalLink
-    ) ?? doc.querySelector<HTMLAnchorElement>('a[href*="id_servizio=376"]');
+    ) ??
+    doc.querySelector<HTMLAnchorElement>(
+      POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.fallbackContinueToPortalLink
+    );
 
   if (continueLink) {
     const navigatedTo = continueLink.href || POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
@@ -271,7 +277,7 @@ export function submitPolimiOtp(
   const rawOtp = typeof otpInputOrParams === 'string' ? otpInputOrParams : otpInputOrParams.otp;
   const otpField =
     doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector) ??
-    doc.querySelector<HTMLInputElement>('input#codice_otp[name="codice_otp"], input#codice_otp');
+    doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackOtpInputSelector);
 
   if (!otpField) {
     return {

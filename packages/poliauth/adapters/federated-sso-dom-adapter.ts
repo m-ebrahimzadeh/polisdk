@@ -15,6 +15,7 @@ import type {
   PageLocationSnapshot
 } from '../interfaces/browser-driver-port.js';
 import type {
+  FederatedLoginTriggerSpec,
   FederatedSsoProviderAdapterPort,
   FederatedSsoProviderSpec
 } from '../interfaces/federated-sso-provider-port.js';
@@ -48,6 +49,18 @@ function querySelectorSafe<T extends Element = Element>(doc: Document, selector?
   }
 }
 
+function matchesLoginTriggerLocation(
+  trigger: FederatedLoginTriggerSpec,
+  loc: PageLocationSnapshot
+): boolean {
+  const hostOk =
+    trigger.hostnames.length === 0 || hostnameMatches(loc.hostname, trigger.hostnames);
+  const pathOk =
+    !trigger.pathnameSubstrings?.length ||
+    trigger.pathnameSubstrings.some((fragment) => loc.pathname.includes(fragment));
+  return hostOk && pathOk;
+}
+
 /**
  * Checks whether a URL/hostname belongs to the provider's SAML transit endpoints
  * or to the PoliMi SAML Identity Provider (`POLIMI_LOGIN_FLOW_SPEC.samlIdentityProvider`).
@@ -74,19 +87,53 @@ export function isFederatedIdentifierPromptPage(
   doc: Document,
   loc: PageLocationSnapshot
 ): boolean {
-  if (querySelectorSafe(doc, spec.identifierPrompt.identifierInputSelector)) {
+  const prompt = spec.identifierPrompt;
+  if (!prompt) {
+    return false;
+  }
+  if (querySelectorSafe(doc, prompt.identifierInputSelector)) {
     return true;
   }
   return (
-    hostnameMatches(loc.hostname, spec.identifierPrompt.hostnames) ||
-    spec.identifierPrompt.pathnameSubstrings.some((fragment) => loc.pathname.includes(fragment))
+    hostnameMatches(loc.hostname, prompt.hostnames) ||
+    Boolean(prompt.pathnameSubstrings?.some((fragment) => loc.pathname.includes(fragment)))
   );
 }
 
 /**
+ * Checks whether the current DOM/location corresponds to the provider's
+ * click-through SSO login trigger landing page.
+ */
+export function isFederatedLoginTriggerPage(
+  spec: FederatedSsoProviderSpec,
+  doc: Document,
+  loc: PageLocationSnapshot
+): boolean {
+  const trigger = spec.loginTrigger;
+  if (!trigger) {
+    return false;
+  }
+  if (
+    matchesLoginTriggerLocation(trigger, loc) &&
+    querySelectorSafe(doc, trigger.triggerSelector)
+  ) {
+    return true;
+  }
+  const hostMatches =
+    trigger.hostnames.length > 0 && hostnameMatches(loc.hostname, trigger.hostnames);
+  if (!hostMatches) {
+    return false;
+  }
+  if (trigger.pathnameSubstrings?.length) {
+    return trigger.pathnameSubstrings.some((fragment) => loc.pathname.includes(fragment));
+  }
+  return !hostnameMatches(loc.hostname, spec.authenticatedHostnames);
+}
+
+/**
  * Classifies the current page from a federated Service Provider's perspective:
- * - `'error'`: inline validation error rendered on the identifier prompt
- * - `'login_required'`: identifier prompt input rendered (`isIdentifierPrompt: true`)
+ * - `'error'`: inline validation/banner error rendered on the SP prompt or login landing page
+ * - `'login_required'`: identifier prompt (`isIdentifierPrompt: true`) or click-through trigger (`isLoginTrigger: true`) rendered
  * - `'sso_in_transit'`: SAML POST binding form, SP transit endpoint, or PoliMi IdP page
  * - `'authenticated'`: authenticated SP application reached
  */
@@ -99,31 +146,40 @@ export function inspectFederatedSsoPageBySpec(
   const providerId = spec.providerId;
   const isTransit = isFederatedSsoTransitLocation(spec, url, loc.hostname);
 
-  const contextualError = querySelectorSafe(
-    doc,
-    spec.identifierPrompt.contextualErrorSelector
-  )?.textContent?.trim();
+  const contextualError =
+    querySelectorSafe(doc, spec.identifierPrompt?.contextualErrorSelector)?.textContent?.trim() ||
+    querySelectorSafe(doc, spec.loginTrigger?.contextualErrorSelector)?.textContent?.trim();
   if (contextualError) {
     const hasIdentifierInput = Boolean(
-      querySelectorSafe(doc, spec.identifierPrompt.identifierInputSelector)
+      spec.identifierPrompt &&
+        querySelectorSafe(doc, spec.identifierPrompt.identifierInputSelector)
+    );
+    const hasLoginTrigger = Boolean(
+      !hasIdentifierInput &&
+        spec.loginTrigger &&
+        matchesLoginTriggerLocation(spec.loginTrigger, loc) &&
+        querySelectorSafe(doc, spec.loginTrigger.triggerSelector)
     );
     return {
       providerId,
       status: 'error',
       isIdentifierPrompt: hasIdentifierInput,
-      isEmailSsoPage: hasIdentifierInput,
+      isLoginTrigger: hasLoginTrigger,
       isSamlTransitPage: isTransit,
       url,
       reason: contextualError
     };
   }
 
-  if (querySelectorSafe(doc, spec.identifierPrompt.identifierInputSelector)) {
+  if (
+    spec.identifierPrompt &&
+    querySelectorSafe(doc, spec.identifierPrompt.identifierInputSelector)
+  ) {
     return {
       providerId,
       status: 'login_required',
       isIdentifierPrompt: true,
-      isEmailSsoPage: true,
+      isLoginTrigger: false,
       isSamlTransitPage: true,
       url,
       reason: `${spec.displayName} SAML SSO identifier prompt detected`
@@ -135,21 +191,40 @@ export function inspectFederatedSsoPageBySpec(
       providerId,
       status: 'sso_in_transit',
       isIdentifierPrompt: false,
-      isEmailSsoPage: false,
+      isLoginTrigger: false,
       isSamlTransitPage: true,
       url,
       reason: 'SAML assertion or redirect form in progress'
     };
   }
 
-  if (spec.authenticatedSelectors?.some((selector) => querySelectorSafe(doc, selector))) {
+  if (
+    !isTransit &&
+    spec.authenticatedSelectors?.some((selector) => querySelectorSafe(doc, selector))
+  ) {
     return {
       providerId,
       status: 'authenticated',
       isIdentifierPrompt: false,
-      isEmailSsoPage: false,
+      isLoginTrigger: false,
       isSamlTransitPage: false,
       url
+    };
+  }
+
+  if (
+    spec.loginTrigger &&
+    matchesLoginTriggerLocation(spec.loginTrigger, loc) &&
+    querySelectorSafe(doc, spec.loginTrigger.triggerSelector)
+  ) {
+    return {
+      providerId,
+      status: 'login_required',
+      isIdentifierPrompt: false,
+      isLoginTrigger: true,
+      isSamlTransitPage: false,
+      url,
+      reason: `${spec.displayName} SSO login trigger detected`
     };
   }
 
@@ -158,10 +233,22 @@ export function inspectFederatedSsoPageBySpec(
       providerId,
       status: 'sso_in_transit',
       isIdentifierPrompt: false,
-      isEmailSsoPage: false,
+      isLoginTrigger: false,
       isSamlTransitPage: true,
       url,
       reason: `Waiting for ${spec.displayName} identifier prompt to render`
+    };
+  }
+
+  if (isFederatedLoginTriggerPage(spec, doc, loc)) {
+    return {
+      providerId,
+      status: 'sso_in_transit',
+      isIdentifierPrompt: false,
+      isLoginTrigger: false,
+      isSamlTransitPage: true,
+      url,
+      reason: `Waiting for ${spec.displayName} login trigger to render`
     };
   }
 
@@ -170,7 +257,7 @@ export function inspectFederatedSsoPageBySpec(
       providerId,
       status: 'sso_in_transit',
       isIdentifierPrompt: false,
-      isEmailSsoPage: false,
+      isLoginTrigger: false,
       isSamlTransitPage: true,
       url,
       reason: 'Browser is on a SAML SP/IdP transit endpoint'
@@ -182,7 +269,7 @@ export function inspectFederatedSsoPageBySpec(
       providerId,
       status: 'authenticated',
       isIdentifierPrompt: false,
-      isEmailSsoPage: false,
+      isLoginTrigger: false,
       isSamlTransitPage: false,
       url
     };
@@ -192,7 +279,7 @@ export function inspectFederatedSsoPageBySpec(
     providerId,
     status: 'sso_in_transit',
     isIdentifierPrompt: false,
-    isEmailSsoPage: false,
+    isLoginTrigger: false,
     isSamlTransitPage: false,
     url,
     reason: 'Waiting for federated SSO state resolution'
@@ -209,6 +296,21 @@ export function submitFederatedIdentifierBySpec(
   identifier: string
 ): PageActionResult {
   const prompt = spec.identifierPrompt;
+  if (!prompt) {
+    return {
+      ok: false,
+      error: `${spec.displayName} SSO spec does not define an identifierPrompt.`
+    };
+  }
+
+  const cleanIdentifier = identifier.trim();
+  if (!cleanIdentifier) {
+    return {
+      ok: false,
+      error: `${spec.displayName} SSO requires a non-empty federated identifier.`
+    };
+  }
+
   const input = querySelectorSafe<HTMLInputElement>(doc, prompt.identifierInputSelector);
   if (!input) {
     return {
@@ -219,7 +321,7 @@ export function submitFederatedIdentifierBySpec(
 
   const EventCtor = doc.defaultView?.Event ?? Event;
   input.focus();
-  input.value = identifier.trim();
+  input.value = cleanIdentifier;
   input.dispatchEvent(new EventCtor('input', { bubbles: true }));
   input.dispatchEvent(new EventCtor('change', { bubbles: true }));
   input.dispatchEvent(new EventCtor('blur', { bubbles: true }));
@@ -251,8 +353,44 @@ export function submitFederatedIdentifierBySpec(
 }
 
 /**
+ * Triggers the SP's click-through SSO login button or link (Mode B `loginTrigger`).
+ */
+export function triggerFederatedLoginBySpec(
+  spec: FederatedSsoProviderSpec,
+  doc: Document
+): PageActionResult {
+  const triggerSpec = spec.loginTrigger;
+  if (!triggerSpec) {
+    return {
+      ok: false,
+      error: `${spec.displayName} SSO spec does not define a loginTrigger.`
+    };
+  }
+
+  const triggerEl = querySelectorSafe<HTMLElement>(doc, triggerSpec.triggerSelector);
+  if (!triggerEl) {
+    return {
+      ok: false,
+      error: `${spec.displayName} SSO login trigger (${triggerSpec.triggerSelector}) not found on page.`
+    };
+  }
+
+  if (triggerSpec.forceEnableTrigger) {
+    if ('disabled' in triggerEl) {
+      (triggerEl as HTMLButtonElement | HTMLInputElement).disabled = false;
+    }
+    triggerEl.removeAttribute('disabled');
+    triggerEl.removeAttribute('aria-disabled');
+  }
+
+  triggerEl.focus?.();
+  triggerEl.click();
+  return { ok: true };
+}
+
+/**
  * Generic `FederatedSsoProviderAdapterPort` driven entirely by a declarative
- * `FederatedSsoProviderSpec`. Most SAML SPs (Zoom, Piazza, GitLab, Microsoft 365, ...)
+ * `FederatedSsoProviderSpec`. Most SAML/Shibboleth SPs (Webex, Zoom, WeBeep, GitLab, ...)
  * can be supported by writing a spec alone, without subclassing.
  */
 export class SelectorFederatedSsoProviderAdapter implements FederatedSsoProviderAdapterPort {
@@ -276,5 +414,9 @@ export class SelectorFederatedSsoProviderAdapter implements FederatedSsoProvider
 
   submitIdentifier(doc: Document, identifier: string): PageActionResult {
     return submitFederatedIdentifierBySpec(this.spec, doc, identifier);
+  }
+
+  triggerLogin(doc: Document): PageActionResult {
+    return triggerFederatedLoginBySpec(this.spec, doc);
   }
 }
