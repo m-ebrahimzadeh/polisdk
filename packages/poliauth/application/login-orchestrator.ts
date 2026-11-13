@@ -6,10 +6,14 @@
  * completely decoupled from downstream service navigation.
  */
 
-import type {
-  IdentityId,
-  LoginCredentials,
-  LoginFlowStatus
+import {
+  classifyPolimiFailure,
+  PoliAuthDiagnosticError,
+  type IdentityId,
+  type LoginCredentials,
+  type LoginFlowStatus,
+  type PoliAuthDiagnosticErrorPayload,
+  type PoliAuthFailureClassification
 } from '../domain/entities.js';
 import { redactSensitiveErrorText } from '../domain/redaction.js';
 import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
@@ -27,6 +31,23 @@ import { createRedactingLogger } from './redacting-logger.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractDiagnosticFromError(
+  err: unknown,
+  operation: string,
+  url?: string
+): PoliAuthDiagnosticErrorPayload {
+  if (err instanceof PoliAuthDiagnosticError) {
+    return err.payload;
+  }
+  return classifyPolimiFailure({
+    component: '@polisdk/poliauth/application/login-orchestrator',
+    operation,
+    stage: 'error',
+    url,
+    error: err
+  });
 }
 
 function isTransientNavigationError(err: unknown): boolean {
@@ -74,6 +95,8 @@ export interface PolimiSessionAuthOutcome {
   status: LoginFlowStatus;
   url?: string;
   error?: string;
+  classification?: PoliAuthFailureClassification;
+  diagnostic?: PoliAuthDiagnosticErrorPayload;
 }
 
 export interface FederatedSamlAuthRequest {
@@ -113,6 +136,8 @@ export interface FederatedSamlAuthOutcome {
   ok: boolean;
   status: 'authenticated' | 'waiting_for_login' | 'failed';
   error?: string;
+  classification?: PoliAuthFailureClassification;
+  diagnostic?: PoliAuthDiagnosticErrorPayload;
 }
 
 export interface FederatedSamlFlowState {
@@ -236,8 +261,24 @@ export class PoliAuthOrchestrator {
           otpDebounceUntil = 0;
           if (submittedCredentialsCount > 0 && stageInfo.errorMessage) {
             const errMsg = `PoliMi login rejected: ${stageInfo.errorMessage}`;
+            const diagnostic = classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'submitCredentials',
+              stage: 'credentials',
+              url: stageInfo.url,
+              httpStatus: stageInfo.httpStatus,
+              diagnosticSnapshot: stageInfo.diagnosticSnapshot,
+              error: errMsg
+            });
             await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
+            return {
+              ok: false,
+              status: 'failed',
+              url: stageInfo.url,
+              error: errMsg,
+              classification: diagnostic.classification,
+              diagnostic
+            };
           }
 
           if (
@@ -253,8 +294,24 @@ export class PoliAuthOrchestrator {
             const errMsg =
               stageInfo.errorMessage ||
               'PoliMi login remained on credentials page after submission.';
+            const diagnostic = classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'submitCredentials',
+              stage: 'credentials',
+              url: stageInfo.url,
+              httpStatus: stageInfo.httpStatus,
+              diagnosticSnapshot: stageInfo.diagnosticSnapshot,
+              error: errMsg
+            });
             await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
+            return {
+              ok: false,
+              status: 'failed',
+              url: stageInfo.url,
+              error: errMsg,
+              classification: diagnostic.classification,
+              diagnostic
+            };
           }
 
           const personCode = credentials.personCode?.trim() || '';
@@ -262,8 +319,22 @@ export class PoliAuthOrchestrator {
           if (!personCode || !password) {
             const errMsg =
               'Person Code and Password are required to sign in on aunicalogin.polimi.it.';
+            const diagnostic = classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'submitCredentials',
+              stage: 'credentials',
+              url: stageInfo.url,
+              error: errMsg
+            });
             await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
+            return {
+              ok: false,
+              status: 'failed',
+              url: stageInfo.url,
+              error: errMsg,
+              classification: diagnostic.classification,
+              diagnostic
+            };
           }
 
           submittedCredentialsCount += 1;
@@ -272,17 +343,32 @@ export class PoliAuthOrchestrator {
             'Submitting PoliMi credentials...'
           );
 
-          const credResult = await driver.submitCredentials({
+          const credResult = (await driver.submitCredentials({
             personCode,
             password,
             stayConnected: true
-          });
+          })) as { ok: boolean; error?: string; diagnostic?: PoliAuthDiagnosticErrorPayload };
 
           if (!credResult.ok) {
-            const errMsg =
-              credResult.error || 'Failed to submit PoliMi credentials.';
+            const diagnostic =
+              credResult.diagnostic ??
+              classifyPolimiFailure({
+                component: '@polisdk/poliauth/application/login-orchestrator',
+                operation: 'submitCredentials',
+                stage: 'credentials',
+                url: stageInfo.url,
+                error: credResult.error || 'Failed to submit PoliMi credentials.'
+              });
+            const errMsg = credResult.error || diagnostic.message;
             await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
+            return {
+              ok: false,
+              status: 'failed',
+              url: stageInfo.url,
+              error: errMsg,
+              classification: diagnostic.classification,
+              diagnostic
+            };
           }
 
           credentialsDebounceUntil = Date.now() + postSubmitDebounceMs;
@@ -298,8 +384,24 @@ export class PoliAuthOrchestrator {
           credentialsDebounceUntil = 0;
           if (submittedManualOtpCount > 0 && stageInfo.errorMessage) {
             const errMsg = `PoliMi 2FA OTP rejected: ${stageInfo.errorMessage}`;
+            const diagnostic = classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'submitOtp',
+              stage: 'otp',
+              url: stageInfo.url,
+              httpStatus: stageInfo.httpStatus,
+              diagnosticSnapshot: stageInfo.diagnosticSnapshot,
+              error: errMsg
+            });
             await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
+            return {
+              ok: false,
+              status: 'failed',
+              url: stageInfo.url,
+              error: errMsg,
+              classification: diagnostic.classification,
+              diagnostic
+            };
           }
 
           if (
@@ -316,8 +418,24 @@ export class PoliAuthOrchestrator {
             const errMsg =
               stageInfo.errorMessage ||
               `PoliMi 2FA manual OTP exceeded maximum retry attempts (${effectiveMaxManualOtpAttempts}).`;
+            const diagnostic = classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'submitOtp',
+              stage: 'otp',
+              url: stageInfo.url,
+              httpStatus: stageInfo.httpStatus,
+              diagnosticSnapshot: stageInfo.diagnosticSnapshot,
+              error: errMsg
+            });
             await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
+            return {
+              ok: false,
+              status: 'failed',
+              url: stageInfo.url,
+              error: errMsg,
+              classification: diagnostic.classification,
+              diagnostic
+            };
           }
 
           let otpToSubmit = '';
@@ -341,11 +459,31 @@ export class PoliAuthOrchestrator {
           }
 
           await notify('submitting_otp', 'Submitting 6-digit 2FA code...');
-          const otpResult = await driver.submitOtp({ otp: otpToSubmit });
+          const otpResult = (await driver.submitOtp({ otp: otpToSubmit })) as {
+            ok: boolean;
+            error?: string;
+            diagnostic?: PoliAuthDiagnosticErrorPayload;
+          };
           if (!otpResult.ok) {
-            const errMsg = otpResult.error || 'Failed to submit 2FA OTP.';
+            const diagnostic =
+              otpResult.diagnostic ??
+              classifyPolimiFailure({
+                component: '@polisdk/poliauth/application/login-orchestrator',
+                operation: 'submitOtp',
+                stage: 'otp',
+                url: stageInfo.url,
+                error: otpResult.error || 'Failed to submit 2FA OTP.'
+              });
+            const errMsg = otpResult.error || diagnostic.message;
             await notify('failed', errMsg);
-            return { ok: false, status: 'failed', error: errMsg };
+            return {
+              ok: false,
+              status: 'failed',
+              url: stageInfo.url,
+              error: errMsg,
+              classification: diagnostic.classification,
+              diagnostic
+            };
           }
 
           otpDebounceUntil = Date.now() + postSubmitDebounceMs;
@@ -354,6 +492,30 @@ export class PoliAuthOrchestrator {
           }
           if (pollDelayMs > 0) await sleep(Math.min(450, pollDelayMs));
           continue;
+        }
+
+        // 4.5 Deterministic Outage vs. Selector Drift short-circuit on unknown stage
+        if (
+          stageInfo.stage === 'unknown' &&
+          stageInfo.diagnosticError &&
+          (stageInfo.diagnosticError.classification === 'PORTAL_OUTAGE_OR_NETWORK_ERROR' ||
+            stageInfo.diagnosticError.classification === 'DOM_SELECTOR_DRIFT')
+        ) {
+          const diag = stageInfo.diagnosticError;
+          if (diag.classification === 'PORTAL_OUTAGE_OR_NETWORK_ERROR') {
+            this.logger?.warn(`PoliMi outage detected: ${diag.message}`, diag);
+          } else {
+            this.logger?.error(`PoliMi DOM selector drift detected: ${diag.message}`, diag);
+          }
+          await notify('failed', diag.message);
+          return {
+            ok: false,
+            status: 'failed',
+            url: stageInfo.url,
+            error: diag.message,
+            classification: diag.classification,
+            diagnostic: diag
+          };
         }
 
         credentialsDebounceUntil = 0;
@@ -368,10 +530,17 @@ export class PoliAuthOrchestrator {
       await notify('failed', timeoutMsg);
       return { ok: false, status: 'failed', error: timeoutMsg };
     } catch (err) {
-      const msg = redactSensitiveErrorText(err);
-      this.logger?.error(`PoliMi authentication failed: ${msg}`);
+      const diagnostic = extractDiagnosticFromError(err, 'authenticate', entryUrl);
+      const msg = diagnostic.message || redactSensitiveErrorText(err);
+      this.logger?.error(`PoliMi authentication failed: ${msg}`, diagnostic);
       await notify('failed', msg);
-      return { ok: false, status: 'failed', error: msg };
+      return {
+        ok: false,
+        status: 'failed',
+        error: msg,
+        classification: diagnostic.classification,
+        diagnostic
+      };
     }
   }
 
@@ -394,8 +563,18 @@ export class PoliAuthOrchestrator {
   }): Promise<
     | { action: 'continue_polling' }
     | { action: 'authenticated_or_ready' }
-    | { action: 'login_required'; reason: string }
-    | { action: 'failed'; reason: string }
+    | {
+        action: 'login_required';
+        reason: string;
+        classification?: PoliAuthFailureClassification;
+        diagnostic?: PoliAuthDiagnosticErrorPayload;
+      }
+    | {
+        action: 'failed';
+        reason: string;
+        classification?: PoliAuthFailureClassification;
+        diagnostic?: PoliAuthDiagnosticErrorPayload;
+      }
   > {
     const {
       userId,
@@ -422,9 +601,30 @@ export class PoliAuthOrchestrator {
         );
         return { action: 'continue_polling' };
       }
-      const reason = redactSensitiveErrorText(err);
-      this.logger?.error(`PoliMi stage inspection failed during SAML SSO: ${reason}`);
-      return { action: 'failed', reason };
+      const diagnostic = extractDiagnosticFromError(err, 'handleFederatedSamlStep');
+      const reason = diagnostic.message || redactSensitiveErrorText(err);
+      this.logger?.error(`PoliMi stage inspection failed during SAML SSO: ${reason}`, diagnostic);
+      return {
+        action: 'failed',
+        reason,
+        classification: diagnostic.classification,
+        diagnostic
+      };
+    }
+
+    if (
+      polimiStage &&
+      polimiStage.stage === 'unknown' &&
+      polimiStage.diagnosticError &&
+      (polimiStage.diagnosticError.classification === 'PORTAL_OUTAGE_OR_NETWORK_ERROR' ||
+        polimiStage.diagnosticError.classification === 'DOM_SELECTOR_DRIFT')
+    ) {
+      return {
+        action: 'failed',
+        reason: polimiStage.diagnosticError.message,
+        classification: polimiStage.diagnosticError.classification,
+        diagnostic: polimiStage.diagnosticError
+      };
     }
 
     // 1. PoliMi expired session / security violation recovery during SAML SSO
@@ -811,7 +1011,9 @@ export class PoliAuthOrchestrator {
           return {
             ok: false,
             status: 'failed',
-            error: res.reason
+            error: res.reason,
+            ...(res.classification ? { classification: res.classification } : {}),
+            ...(res.diagnostic ? { diagnostic: res.diagnostic } : {})
           };
         }
 
@@ -819,7 +1021,9 @@ export class PoliAuthOrchestrator {
           return {
             ok: false,
             status: 'waiting_for_login',
-            error: res.reason
+            error: res.reason,
+            ...(res.classification ? { classification: res.classification } : {}),
+            ...(res.diagnostic ? { diagnostic: res.diagnostic } : {})
           };
         }
 
@@ -836,13 +1040,16 @@ export class PoliAuthOrchestrator {
         error: timeoutMsg
       };
     } catch (err) {
-      const msg = redactSensitiveErrorText(err);
-      this.logger?.error(`Federated SAML authentication failed: ${msg}`);
+      const diagnostic = extractDiagnosticFromError(err, 'authenticateFederatedSaml', entryUrl);
+      const msg = diagnostic.message || redactSensitiveErrorText(err);
+      this.logger?.error(`Federated SAML authentication failed: ${msg}`, diagnostic);
       await callbacks?.onStatusChange?.('failed', msg);
       return {
         ok: false,
         status: 'failed',
-        error: msg
+        error: msg,
+        classification: diagnostic.classification,
+        diagnostic
       };
     }
   }

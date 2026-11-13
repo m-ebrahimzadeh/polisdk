@@ -469,4 +469,152 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     );
     expect(triggerFederatedLoginBySpec(directSpec, authDom.window.document).ok).toBe(false);
   });
+
+  it('classifies HTTP 503, maintenance banner, and empty body as PORTAL_OUTAGE_OR_NETWORK_ERROR', () => {
+    const gwDom = new JSDOM(`<!DOCTYPE html><html><body>503 Service Unavailable</body></html>`, {
+      url: 'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376'
+    });
+    const res503 = inspectPolimiPageStage(gwDom.window.document, gwDom.window.location, {
+      httpStatus: 503
+    });
+    expect(res503.stage).toBe('unknown');
+    expect(res503.httpStatus).toBe(503);
+    expect(res503.diagnosticError?.classification).toBe('PORTAL_OUTAGE_OR_NETWORK_ERROR');
+
+    const maintDom = new JSDOM(
+      `<!DOCTYPE html><html><body>
+        <div class="poli-messages"><div class="alert-warning"><span class="jaf-message">Servizio temporaneamente non disponibile per manutenzione programmata.</span></div></div>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp' }
+    );
+    const resMaint = inspectPolimiPageStage(maintDom.window.document, maintDom.window.location, {
+      httpStatus: 200
+    });
+    expect(resMaint.stage).toBe('unknown');
+    expect(resMaint.diagnosticSnapshot?.hasMaintenanceBanner).toBe(true);
+    expect(resMaint.diagnosticError?.classification).toBe('PORTAL_OUTAGE_OR_NETWORK_ERROR');
+
+    const emptyDom = new JSDOM(`<!DOCTYPE html><html><body></body></html>`, {
+      url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp'
+    });
+    const resEmpty = inspectPolimiPageStage(emptyDom.window.document, emptyDom.window.location, {
+      httpStatus: 200
+    });
+    expect(resEmpty.stage).toBe('unknown');
+    expect(resEmpty.diagnosticSnapshot?.hasEmptyBody).toBe(true);
+    expect(resEmpty.diagnosticError?.classification).toBe('PORTAL_OUTAGE_OR_NETWORK_ERROR');
+  });
+
+  it('classifies populated HTTP 200 redesigned PoliMi IdP DOM as DOM_SELECTOR_DRIFT and scrubs secrets', () => {
+    const redesignedDom = new JSDOM(
+      `<!DOCTYPE html>
+      <html>
+        <head><title>Politecnico di Milano - New SSO</title></head>
+        <body>
+          <main class="new-idp-layout">
+            <h1>Accesso Unico</h1>
+            <form action="/new-login">
+              <input id="renamed-user-field" name="username" />
+              <input id="renamed-pass-field" type="password" name="pass" />
+              <button type="submit">Entra</button>
+            </form>
+          </main>
+        </body>
+      </html>`,
+      {
+        url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do?SAMLRequest=TOPSECRET_SAML_PAYLOAD&__pj1=SECRET_PJ1_HASH&ticket=ST-999-SECRET&password=SecretPassword123!'
+      }
+    );
+
+    const inspection = inspectPolimiPageStage(
+      redesignedDom.window.document,
+      redesignedDom.window.location,
+      { httpStatus: 200 }
+    );
+
+    expect(inspection.stage).toBe('unknown');
+    expect(inspection.diagnosticSnapshot?.hasEmptyBody).toBe(false);
+    expect(inspection.diagnosticSnapshot?.hasMaintenanceBanner).toBe(false);
+    expect(inspection.diagnosticError?.classification).toBe('DOM_SELECTOR_DRIFT');
+
+    const serialized = JSON.stringify(inspection);
+    expect(serialized).not.toContain('TOPSECRET_SAML_PAYLOAD');
+    expect(serialized).not.toContain('SECRET_PJ1_HASH');
+    expect(serialized).not.toContain('ST-999-SECRET');
+    expect(serialized).not.toContain('SecretPassword123!');
+    expect(serialized).toContain('[REDACTED]');
+  });
+
+  it('prioritizes non-dissms evn_continua button over earlier #submit-dissms trap, falls back safely, and flags missing submit drift', () => {
+    const clickedIds: string[] = [];
+    const domTrapFirst = new JSDOM(
+      `<!DOCTYPE html><html><body>
+        <form id="form_scelta2fa" action="IdentificazioneDFA.do">
+          <input id="otp" name="otp" type="text" />
+          <button id="submit-dissms" name="evn_continua" type="submit">Disabilita SMS</button>
+          <button id="btn-continua-otp" name="evn_continua" type="submit">Continua</button>
+        </form>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneDFA.do' }
+    );
+    domTrapFirst.window.document
+      .getElementById('submit-dissms')
+      ?.addEventListener('click', (e) => {
+        e.preventDefault();
+        clickedIds.push('submit-dissms');
+      });
+    domTrapFirst.window.document
+      .getElementById('btn-continua-otp')
+      ?.addEventListener('click', (e) => {
+        e.preventDefault();
+        clickedIds.push('btn-continua-otp');
+      });
+
+    const priorityRes = submitPolimiOtp(
+      domTrapFirst.window.document,
+      '654321',
+      domTrapFirst.window.location
+    );
+    expect(priorityRes.ok).toBe(true);
+    expect(clickedIds).toEqual(['btn-continua-otp']);
+
+    // Sole visible button fallback to #submit-dissms (while skipping .jaf-visually-hidden)
+    const fallbackClicks: string[] = [];
+    const domSoleDissms = new JSDOM(
+      `<!DOCTYPE html><html><body>
+        <form id="form_scelta2fa" action="IdentificazioneDFA.do">
+          <button class="jaf-visually-hidden" name="evn_continua" type="submit">Hidden</button>
+          <input id="otp" name="otp" type="text" />
+          <button id="submit-dissms" name="evn_continua" type="submit">Continua</button>
+        </form>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneDFA.do' }
+    );
+    domSoleDissms.window.document
+      .getElementById('submit-dissms')
+      ?.addEventListener('click', (e) => {
+        e.preventDefault();
+        fallbackClicks.push('submit-dissms');
+      });
+    const fallbackRes = submitPolimiOtp(
+      domSoleDissms.window.document,
+      '654321',
+      domSoleDissms.window.location
+    );
+    expect(fallbackRes.ok).toBe(true);
+    expect(fallbackClicks).toEqual(['submit-dissms']);
+
+    // Missing submit button and no form -> DOM_SELECTOR_DRIFT diagnostic
+    const domNoSubmit = new JSDOM(
+      `<!DOCTYPE html><html><body><div id="otp-wrap"><input id="otp" name="otp" /></div></body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneDFA.do' }
+    );
+    const missingSubmitRes = submitPolimiOtp(
+      domNoSubmit.window.document,
+      '654321',
+      domNoSubmit.window.location
+    );
+    expect(missingSubmitRes.ok).toBe(false);
+    expect(missingSubmitRes.diagnostic?.classification).toBe('DOM_SELECTOR_DRIFT');
+  });
 });

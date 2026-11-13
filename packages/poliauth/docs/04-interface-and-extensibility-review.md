@@ -220,7 +220,17 @@ export class RedisVaultStorage implements VaultStoragePort, VaultSecretMaterialP
 
 ---
 
-## 5. Verification Matrix
+## 5. Failure Classification & Diagnostic Extensibility (`TASK-6.2`)
+
+To prevent infrastructure outages from masquerading as HTML selector drift (and vice versa), Layer 1 (`domain/entities.ts` & `domain/login-flow-spec.ts`) defines a deterministic taxonomy shared inward across `PolimiDomAdapter`, `PoliAuthOrchestrator`, and `PlaywrightAuthPageDriver`:
+
+- **`PoliAuthFailureClassification`**: `'PORTAL_OUTAGE_OR_NETWORK_ERROR' | 'DOM_SELECTOR_DRIFT' | 'AUTHENTICATION_REJECTED' | 'OTP_CHALLENGE_FAILED' | 'TARGET_CLOSED' | 'UNKNOWN_FAILURE'`.
+- **`classifyPolimiFailure()` & `PoliAuthDiagnosticError`**: Evaluates `POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators` (HTTP `500/502/503/504`, `ETIMEDOUT`/`ECONNREFUSED`/`ERR_*`, maintenance banners, empty bodies) before inspecting populated HTTP `200` known IdP hostnames for missing selectors (`DOM_SELECTOR_DRIFT`), sanitizing every field through `redactSecrets` / `redactSensitiveErrorText`.
+- **`PoliAuthOrchestrator` Short-Circuiting**: Both `authenticate()` and `handleFederatedSamlStep()` inspect `stageInfo.diagnosticError` / transport errors and terminate cleanly with `outcome.classification` and `outcome.diagnostic` rather than polling across transient wait loops.
+
+---
+
+## 6. Verification Matrix
 
 | Verification Check | Target | Status |
 | :--- | :--- | :--- |
@@ -229,5 +239,6 @@ export class RedisVaultStorage implements VaultStoragePort, VaultSecretMaterialP
 | OCP compliance on SAML Providers | Pluggable `FederatedSsoProviderAdapterPort` & `SelectorFederatedSsoProviderAdapter` | Verified |
 | Spec-driven federated drivers (zero legacy shims) | `WebexSamlProviderAdapter` wraps `WEBEX_SAML_FLOW_SPEC`; Playwright & Chrome drivers inject `FederatedSsoProviderSpec` directly; legacy shims purged | Verified |
 | Storage & Session Pool ISP | Segregated interfaces with composite backwards-compatible ports | Verified |
+| Outage vs. Selector Drift Disambiguation | `PoliAuthFailureClassification`, `classifyPolimiFailure`, `PoliAuthDiagnosticError` | Verified (`[FACT:EXEC]`) |
 | Typecheck across all 5 packages | 0 errors (`npm run typecheck`) | Verified |
-| Vitest test suites | 13/13 test files, 70/70 tests passing (`npm test`) | Verified |
+| Vitest test suites | 14/14 test files, 87/87 tests passing (`npm test`) | Verified (`[FACT:EXEC]`) |

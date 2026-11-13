@@ -4,6 +4,7 @@ import { PoliAuthOrchestrator } from '../application/login-orchestrator.js';
 import { OtpChallengeCoordinator } from '../application/otp-challenge.js';
 import { TotpService } from '../domain/totp.js';
 import type {
+  PoliAuthDiagnosticErrorPayload,
   PolimiStageInspectionResult,
   FederatedSsoInspectionResult
 } from '../domain/entities.js';
@@ -532,5 +533,202 @@ describe('PoliAuthOrchestrator', () => {
     expect(driver.triggeredLoginCount).toBe(0);
     expect(driver.submittedCreds).toHaveLength(1);
     expect(driver.submittedOtps).toHaveLength(1);
+  });
+
+  it('short-circuits on PORTAL_OUTAGE_OR_NETWORK_ERROR (ETIMEDOUT / 503 maintenance) without misreporting drift', async () => {
+    const otpCoordinator = new OtpChallengeCoordinator({ totpGenerator: new TotpService() });
+    const orchestrator = new PoliAuthOrchestrator(otpCoordinator);
+    let gotoAttempted = false;
+    let afterGotoInspectCalls = 0;
+
+    const timeoutDriver: FederatedAuthPageDriverPort = {
+      federatedProviderId: 'polimi',
+      goto: async () => {
+        gotoAttempted = true;
+        throw new Error('net::ERR_CONNECTION_TIMED_OUT (ETIMEDOUT) navigating to aunicalogin.polimi.it');
+      },
+      waitForNavigation: async () => undefined,
+      inspectPolimiStage: async () => {
+        if (gotoAttempted) {
+          afterGotoInspectCalls += 1;
+        }
+        return {
+          stage: 'unknown',
+          url: 'https://aunicalogin.polimi.it/',
+          title: ''
+        };
+      },
+      recoverSessionPage: async () => ({ ok: false, navigatedTo: '' }),
+      submitCredentials: async () => ({ ok: false }),
+      submitOtp: async () => ({ ok: false }),
+      inspectFederatedSsoPage: async () => ({
+        providerId: 'polimi',
+        status: 'error',
+        isIdentifierPrompt: false,
+        isLoginTrigger: false,
+        isSamlTransitPage: false,
+        url: ''
+      }),
+      submitFederatedIdentifier: async () => ({ ok: false }),
+      triggerFederatedLogin: async () => ({ ok: false })
+    };
+
+    const netOutcome = await orchestrator.authenticate({
+      userId: 2001,
+      driver: timeoutDriver,
+      pollDelayMs: 0,
+      credentials: {
+        personCode: '10987654',
+        password: 'MyPoliPassword!',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      }
+    });
+
+    expect(netOutcome.ok).toBe(false);
+    expect(netOutcome.status).toBe('failed');
+    expect(netOutcome.classification).toBe('PORTAL_OUTAGE_OR_NETWORK_ERROR');
+    expect(netOutcome.diagnostic?.classification).toBe('PORTAL_OUTAGE_OR_NETWORK_ERROR');
+    expect(afterGotoInspectCalls).toBe(0);
+
+    // Also verify HTTP 503 unknown stage short-circuit on first post-navigation inspection
+    let maintGotoDone = false;
+    let maintAfterGotoInspectCount = 0;
+    const outageDiagnostic: PoliAuthDiagnosticErrorPayload = {
+      component: '@polisdk/poliauth/adapters/polimi-dom-adapter',
+      operation: 'inspectPolimiPageStage',
+      stage: 'unknown',
+      classification: 'PORTAL_OUTAGE_OR_NETWORK_ERROR',
+      selectorOrEndpoint: 'HTTP 503',
+      message: 'PoliMi portal outage detected (HTTP 503)',
+      diagnosticSnapshot: {
+        url: 'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376',
+        pathname: '/aunicalogin/getservizio.xml',
+        httpStatus: 503,
+        hasEmptyBody: false,
+        hasLoginInput: false,
+        hasPasswordInput: false,
+        hasOtpInput: false,
+        hasSsoHandoffForm: false,
+        hasExpiredSessionMarker: false,
+        hasAuthenticatedMarker: false,
+        hasErrorBanner: false,
+        hasMaintenanceBanner: true
+      }
+    };
+    const outageDriver: FederatedAuthPageDriverPort = {
+      ...timeoutDriver,
+      goto: async () => {
+        maintGotoDone = true;
+      },
+      inspectPolimiStage: async () => {
+        if (maintGotoDone) {
+          maintAfterGotoInspectCount += 1;
+        }
+        return {
+          stage: 'unknown',
+          url: 'https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=376',
+          title: '503 Maintenance',
+          httpStatus: 503,
+          diagnosticSnapshot: outageDiagnostic.diagnosticSnapshot,
+          diagnosticError: outageDiagnostic
+        };
+      }
+    };
+
+    const outageOutcome = await orchestrator.authenticate({
+      userId: 2002,
+      driver: outageDriver,
+      pollDelayMs: 0,
+      credentials: {
+        personCode: '10987654',
+        password: 'MyPoliPassword!',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      }
+    });
+
+    expect(outageOutcome.ok).toBe(false);
+    expect(outageOutcome.classification).toBe('PORTAL_OUTAGE_OR_NETWORK_ERROR');
+    expect(maintAfterGotoInspectCount).toBe(1);
+  });
+
+  it('short-circuits on DOM_SELECTOR_DRIFT when populated HTTP 200 PoliMi IdP page has unknown selectors', async () => {
+    const otpCoordinator = new OtpChallengeCoordinator({ totpGenerator: new TotpService() });
+    const orchestrator = new PoliAuthOrchestrator(otpCoordinator);
+    let gotoDone = false;
+    let afterGotoInspectCalls = 0;
+
+    const driftDiagnostic: PoliAuthDiagnosticErrorPayload = {
+      component: '@polisdk/poliauth/adapters/polimi-dom-adapter',
+      operation: 'inspectPolimiPageStage',
+      stage: 'unknown',
+      classification: 'DOM_SELECTOR_DRIFT',
+      selectorOrEndpoint: 'input#login[name="login"]',
+      message: 'PoliMi DOM selector drift detected on aunicalogin.polimi.it.',
+      diagnosticSnapshot: {
+        url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp',
+        pathname: '/aunicalogin/aunicalogin.jsp',
+        httpStatus: 200,
+        hasEmptyBody: false,
+        hasLoginInput: false,
+        hasPasswordInput: false,
+        hasOtpInput: false,
+        hasSsoHandoffForm: false,
+        hasExpiredSessionMarker: false,
+        hasAuthenticatedMarker: false,
+        hasErrorBanner: false,
+        hasMaintenanceBanner: false
+      }
+    };
+
+    const driftDriver: FederatedAuthPageDriverPort = {
+      federatedProviderId: 'polimi',
+      goto: async () => {
+        gotoDone = true;
+      },
+      waitForNavigation: async () => undefined,
+      inspectPolimiStage: async () => {
+        if (gotoDone) {
+          afterGotoInspectCalls += 1;
+        }
+        return {
+          stage: 'unknown',
+          url: 'https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp',
+          title: 'Politecnico di Milano - New SSO UI',
+          httpStatus: 200,
+          diagnosticSnapshot: driftDiagnostic.diagnosticSnapshot,
+          diagnosticError: driftDiagnostic
+        };
+      },
+      recoverSessionPage: async () => ({ ok: false, navigatedTo: '' }),
+      submitCredentials: async () => ({ ok: false }),
+      submitOtp: async () => ({ ok: false }),
+      inspectFederatedSsoPage: async () => ({
+        providerId: 'polimi',
+        status: 'error',
+        isIdentifierPrompt: false,
+        isLoginTrigger: false,
+        isSamlTransitPage: false,
+        url: ''
+      }),
+      submitFederatedIdentifier: async () => ({ ok: false }),
+      triggerFederatedLogin: async () => ({ ok: false })
+    };
+
+    const outcome = await orchestrator.authenticate({
+      userId: 2003,
+      driver: driftDriver,
+      pollDelayMs: 0,
+      credentials: {
+        personCode: '10987654',
+        password: 'MyPoliPassword!',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      }
+    });
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe('failed');
+    expect(outcome.classification).toBe('DOM_SELECTOR_DRIFT');
+    expect(outcome.diagnostic?.classification).toBe('DOM_SELECTOR_DRIFT');
+    expect(afterGotoInspectCalls).toBe(1);
   });
 });
