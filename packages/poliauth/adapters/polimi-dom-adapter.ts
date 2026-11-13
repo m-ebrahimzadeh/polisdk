@@ -1,10 +1,12 @@
 import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
 import {
   classifyPolimiFailure,
+  classifyPolimiSemanticError,
   isExpectedPolimiIdpHostname,
   type PoliAuthDiagnosticErrorPayload,
   type PoliAuthDomDiagnosticSnapshot,
   type PolimiPageStage,
+  type PolimiSemanticErrorCode,
   type PolimiStageInspectionResult
 } from '../domain/entities.js';
 import { redactSecrets } from '../domain/redaction.js';
@@ -166,15 +168,34 @@ function hasMaintenanceBannerInDoc(doc: Document): boolean {
 }
 
 function extractErrorAlertText(doc: Document): string | undefined {
-  const candidates = [
+  const dangerCandidates = [
     POLIMI_LOGIN_FLOW_SPEC.credentialsPage.errorAlertSelector,
     POLIMI_LOGIN_FLOW_SPEC.otpPage.errorAlertSelector,
     POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.dangerAlert
   ];
-  for (const sel of candidates) {
+  for (const sel of dangerCandidates) {
     const text = doc.querySelector(sel)?.textContent?.trim();
     if (text) {
       return text;
+    }
+  }
+
+  const warningCandidates = [
+    POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.warningAlert,
+    ...POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.bannerSelectors
+  ];
+  const criticalWarningPatterns = [
+    ...POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators.passwordExpiredPatterns,
+    ...POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators.accountLockedPatterns,
+    ...POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.textPatterns
+  ];
+  for (const sel of warningCandidates) {
+    const text = doc.querySelector(sel)?.textContent?.trim();
+    if (text) {
+      const lower = text.toLowerCase();
+      if (criticalWarningPatterns.some((pattern) => lower.includes(pattern.toLowerCase()))) {
+        return text;
+      }
     }
   }
   return undefined;
@@ -352,6 +373,39 @@ export function inspectPolimiPageStage(
   const httpStatus = options?.httpStatus;
   const dangerError = extractErrorAlertText(doc);
 
+  const buildMatchedStageResult = (
+    stage: Exclude<PolimiPageStage, 'unknown'>
+  ): PolimiStageInspectionResult => {
+    const maintenanceBanner = hasMaintenanceBannerInDoc(doc);
+    const shouldCheckSemantic =
+      Boolean(dangerError) ||
+      maintenanceBanner ||
+      (httpStatus !== undefined && httpStatus >= 500);
+    const snapshotForSemantic = shouldCheckSemantic
+      ? capturePolimiDomDiagnosticSnapshot(doc, loc, httpStatus)
+      : undefined;
+    const semanticErrorCode = shouldCheckSemantic
+      ? classifyPolimiSemanticError({
+          operation: 'inspectPolimiPageStage',
+          stage,
+          url,
+          title,
+          pathname: loc.pathname,
+          httpStatus,
+          errorMessage: dangerError,
+          diagnosticSnapshot: snapshotForSemantic
+        })
+      : undefined;
+    return {
+      stage,
+      url,
+      title,
+      errorMessage: dangerError,
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(semanticErrorCode ? { semanticErrorCode } : {})
+    };
+  };
+
   const buildUnknownResult = (selectorOrEndpoint: string): PolimiStageInspectionResult => {
     const sanitizedUrl = redactSecrets(url);
     const diagnosticSnapshot = capturePolimiDomDiagnosticSnapshot(doc, loc, httpStatus);
@@ -360,6 +414,7 @@ export function inspectPolimiPageStage(
       operation: 'inspectPolimiPageStage',
       stage: 'unknown',
       url: sanitizedUrl,
+      title,
       pathname: loc.pathname,
       httpStatus,
       selectorOrEndpoint,
@@ -371,6 +426,9 @@ export function inspectPolimiPageStage(
       title,
       ...(dangerError ? { errorMessage: redactSecrets(dangerError) } : {}),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(diagnosticError.semanticErrorCode
+        ? { semanticErrorCode: diagnosticError.semanticErrorCode }
+        : {}),
       diagnosticSnapshot,
       diagnosticError
     };
@@ -391,12 +449,7 @@ export function inspectPolimiPageStage(
 
   // 1. Session Expired / Terminated Security Violation page (scoped to PoliMi IdP)
   if (hasSessionExpiredMarkers(doc, loc)) {
-    return {
-      stage: 'session_expired',
-      url,
-      title,
-      errorMessage: dangerError
-    };
+    return buildMatchedStageResult('session_expired');
   }
 
   // 2. Stage 2: 2FA OTP Input Page
@@ -404,12 +457,7 @@ export function inspectPolimiPageStage(
     doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector) ??
     doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackOtpInputSelector);
   if (otpInput) {
-    return {
-      stage: 'otp',
-      url,
-      title,
-      errorMessage: dangerError
-    };
+    return buildMatchedStageResult('otp');
   }
 
   // 3. Intermediate SSO Auto-Submit Handoff (e.g. AunicaLogin.do or doSSO.jsp)
@@ -438,12 +486,7 @@ export function inspectPolimiPageStage(
     POLIMI_LOGIN_FLOW_SPEC.credentialsPage.passwordInputSelector
   );
   if (loginInput && passwordInput) {
-    return {
-      stage: 'credentials',
-      url,
-      title,
-      errorMessage: dangerError
-    };
+    return buildMatchedStageResult('credentials');
   }
 
   // 5. Authenticated PoliMi Session (guard against empty/maintenance pages on servizionline.polimi.it)
@@ -657,5 +700,9 @@ export function submitPolimiOtp(
   };
 }
 
-export { classifyPolimiFailure } from '../domain/entities.js';
-export type { PolimiPageStage, PolimiFailureClassificationInput } from '../domain/entities.js';
+export { classifyPolimiFailure, classifyPolimiSemanticError } from '../domain/entities.js';
+export type {
+  PolimiPageStage,
+  PolimiFailureClassificationInput,
+  PolimiSemanticErrorCode
+} from '../domain/entities.js';

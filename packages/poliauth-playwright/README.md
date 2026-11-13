@@ -29,3 +29,12 @@ npm run probe:live:auth
 POLIAUTH_LIVE_PROBE=1 npm run probe:live
 POLIAUTH_LIVE_PROBE=1 POLIAUTH_LIVE_AUTH_PROBE=1 npm run probe:live:auth
 ```
+
+## Fast-Path Resource Blocking (`TASK-7.3`)
+
+Both `PlaywrightAuthPageDriver` and `PlaywrightBrowserSessionPool` (`PlaywrightSessionPoolOptions` / `PlaywrightBrowserSessionPoolOptions`) support opt-in `enableFastPathResourceBlocking?: boolean` and `fastPathResourceBlockerOptions?: FastPathResourceBlockerOptions`:
+
+- Aborts non-essential `image`, `font`, and `media` requests (`DEFAULT_FAST_PATH_BLOCKED_RESOURCE_TYPES`) plus known third-party telemetry domains (`DEFAULT_FAST_PATH_BLOCKED_TRACKER_DOMAINS`).
+- Explicitly preserves `document`, `script`, `xhr`, `fetch`, `POST` form/SSO submissions, and (by default) `stylesheet` requests so SAML/CAS/2FA flows and error banners remain intact (`blockStylesheets: true` opts in to stylesheet blocking).
+- Uses a `WeakSet`-backed guard in `ensureFastPathResourceBlockingInstalled` so `page.route('**/*', ...)` is registered **at most once per Playwright page** across repeated `acquireUserContext`, `getOrCreatePrimaryPage`, and `goto()` calls.
+

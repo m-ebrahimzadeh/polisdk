@@ -14,7 +14,19 @@ import {
   type IdentityId,
   type SavedVaultCredentials
 } from '../domain/entities.js';
+import { redactSensitiveErrorText } from '../domain/redaction.js';
 import { cleanTotpSecret, isValidTotpSecret } from '../domain/totp.js';
+import type { AuthLoggerPort } from '../interfaces/logger-port.js';
+import type {
+  UserIdentityReaderPort,
+  UserIdentityWriterPort
+} from '../interfaces/storage-port.js';
+import { createRedactingLogger } from './redacting-logger.js';
+
+export interface CredentialSetupWizardOptions {
+  identityRepository?: Partial<UserIdentityReaderPort & UserIdentityWriterPort>;
+  logger?: AuthLoggerPort;
+}
 
 export type WizardStep = 'person_code' | 'password' | 'email' | 'totp_secret';
 
@@ -51,6 +63,57 @@ export type WizardTransitionResult =
 
 export class CredentialSetupWizard {
   private readonly sessions = new Map<string, WizardSessionState>();
+  private readonly identityRepository?: Partial<
+    UserIdentityReaderPort & UserIdentityWriterPort
+  >;
+  private readonly logger?: AuthLoggerPort;
+
+  constructor(options: CredentialSetupWizardOptions = {}) {
+    this.identityRepository = options.identityRepository;
+    this.logger = options.logger ? createRedactingLogger(options.logger) : undefined;
+  }
+
+  private resetLoginStatusOnCompletion(userId: IdentityId): void {
+    const updater = this.identityRepository?.updateLoginStatus;
+    if (!updater) {
+      return;
+    }
+    try {
+      const pending = updater.call(this.identityRepository, userId, 'idle', null);
+      if (pending && typeof (pending as { catch?: unknown }).catch === 'function') {
+        void (pending as Promise<unknown>).catch((err) => {
+          this.logger?.warn(
+            `Failed to reset loginStatus to idle after credential onboarding: ${redactSensitiveErrorText(err)}`
+          );
+        });
+      }
+    } catch (err) {
+      this.logger?.warn(
+        `Failed to reset loginStatus to idle after credential onboarding: ${redactSensitiveErrorText(err)}`
+      );
+    }
+  }
+
+  private completeSession(
+    key: string,
+    session: WizardSessionState,
+    totpSecret: string
+  ): WizardTransitionResult {
+    this.sessions.delete(key);
+    this.resetLoginStatusOnCompletion(session.userId);
+    return {
+      status: 'completed',
+      session,
+      credentials: {
+        personCode: session.personCode,
+        password: session.password,
+        polimiEmail: session.polimiEmail,
+        totpSecret
+      },
+      maskedPersonCode: maskPersonCode(session.personCode),
+      maskedEmail: maskPolimiEmail(session.polimiEmail)
+    };
+  }
 
   public startSession(userId: IdentityId): WizardSessionState {
     const state: WizardSessionState = {
@@ -172,19 +235,7 @@ export class CredentialSetupWizard {
         };
       }
 
-      this.sessions.delete(key);
-      return {
-        status: 'completed',
-        session,
-        credentials: {
-          personCode: session.personCode,
-          password: session.password,
-          polimiEmail: session.polimiEmail,
-          totpSecret: cleaned
-        },
-        maskedPersonCode: maskPersonCode(session.personCode),
-        maskedEmail: maskPolimiEmail(session.polimiEmail)
-      };
+      return this.completeSession(key, session, cleaned);
     }
 
     return null;
@@ -207,18 +258,6 @@ export class CredentialSetupWizard {
       };
     }
 
-    this.sessions.delete(key);
-    return {
-      status: 'completed',
-      session,
-      credentials: {
-        personCode: session.personCode,
-        password: session.password,
-        polimiEmail: session.polimiEmail,
-        totpSecret: ''
-      },
-      maskedPersonCode: maskPersonCode(session.personCode),
-      maskedEmail: maskPolimiEmail(session.polimiEmail)
-    };
+    return this.completeSession(key, session, '');
   }
 }

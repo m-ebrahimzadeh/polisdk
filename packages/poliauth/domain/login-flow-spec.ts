@@ -71,6 +71,12 @@ export interface PolimiLoginFlowSpec {
     readonly networkErrorPatterns: readonly string[];
     readonly bannerSelectors: readonly string[];
   };
+  readonly semanticErrorIndicators: {
+    readonly passwordExpiredPatterns: readonly string[];
+    readonly accountLockedPatterns: readonly string[];
+    readonly invalidCredentialsPatterns: readonly string[];
+    readonly otpRejectedPatterns: readonly string[];
+  };
 }
 
 export const POLIMI_LOGIN_FLOW_SPEC = {
@@ -140,7 +146,7 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
     submitButtonSelector:
       '.aunicalogin-button-accedi button[name="evn_conferma"], button[name="evn_conferma"]:not(.jaf-visually-hidden)',
     fallbackSubmitButtonSelector: 'button[name="evn_conferma"]',
-    errorAlertSelector: '.poli-messages .alert-danger .jaf-message'
+    errorAlertSelector: '.poli-messages .alert-danger .jaf-message, .poli-messages .alert-danger, .alert-danger'
   },
 
   /**
@@ -156,7 +162,7 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
       'button[name="evn_continua"]:not(#submit-dissms):not(.jaf-visually-hidden)',
     fallbackSubmitButtonSelector:
       'button#submit-dissms[name="evn_continua"]:not(.jaf-visually-hidden), button[name="evn_continua"]:not(.jaf-visually-hidden), button[name="evn_continua"]',
-    errorAlertSelector: '.poli-messages .alert-danger .jaf-message'
+    errorAlertSelector: '.poli-messages .alert-danger .jaf-message, .poli-messages .alert-danger, .alert-danger'
   },
 
   /**
@@ -223,6 +229,51 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
       '.poli-messages .alert-danger .jaf-message',
       '.alert-warning',
       '.maintenance-banner'
+    ]
+  },
+  semanticErrorIndicators: {
+    passwordExpiredPatterns: [
+      'password scaduta',
+      'password expired',
+      'cambio password obbligatorio',
+      'aggiornare la password',
+      'modify your password',
+      'rinnovo password',
+      'expired password',
+      'password must be changed'
+    ],
+    accountLockedPatterns: [
+      'account bloccato',
+      'utenza bloccata',
+      'account locked',
+      'troppi tentativi',
+      'too many attempts',
+      'temporaneamente bloccato',
+      'abilitazione sospesa',
+      'utente bloccato',
+      'account suspended'
+    ],
+    invalidCredentialsPatterns: [
+      'credenziali non valide',
+      'codice persona o password errati',
+      'autenticazione fallita',
+      'login fallito',
+      'invalid credentials',
+      'wrong username or password',
+      'utente o password non corretti',
+      'credenziali errate',
+      'login rejected'
+    ],
+    otpRejectedPatterns: [
+      'codice otp non valido',
+      'codice di sicurezza errato',
+      'otp errato',
+      'codice scaduto',
+      'invalid otp',
+      'invalid verification code',
+      'codice errato',
+      'codice otp errato',
+      'otp non valido'
     ]
   }
 } as const satisfies PolimiLoginFlowSpec;

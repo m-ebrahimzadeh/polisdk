@@ -8,7 +8,14 @@ import type {
 } from '@polisdk/poliauth/interfaces';
 import { createRedactingLogger, redactSensitiveErrorText } from '@polisdk/poliauth/middleware';
 import { getInjectedAuthAdapterBundleCode } from './injected-auth-bundle.js';
-import type { PlaywrightPageLike } from './playwright-page-driver.js';
+import {
+  ensureFastPathResourceBlockingInstalled,
+  resolveFastPathResourceBlockerOptions,
+  type FastPathResourceBlockerOptions,
+  type PlaywrightPageLike,
+  type PlaywrightRequestLike,
+  type PlaywrightRouteLike
+} from './playwright-page-driver.js';
 
 function unrefIntervalIfSupported(timer: unknown): void {
   if (
@@ -27,6 +34,13 @@ export interface PlaywrightContextLike<TPage = PlaywrightPageLike> {
   addInitScript(script: string): Promise<void>;
   storageState(): Promise<unknown>;
   close(): Promise<void>;
+  route?(
+    url: string,
+    handler: (
+      route: PlaywrightRouteLike,
+      request?: PlaywrightRequestLike
+    ) => Promise<void> | void
+  ): Promise<void> | void;
 }
 
 export interface PlaywrightBrowserLike<
@@ -78,6 +92,27 @@ export interface PlaywrightSessionPoolOptions<
    * Optional structured logger.
    */
   logger?: AuthLoggerPort;
+  /**
+   * Opt-in Tier 2 fast-path resource blocking (`image`, `font`, `media`, tracker domains)
+   * automatically installed on every primary page returned by the pool.
+   */
+  enableFastPathResourceBlocking?: boolean;
+  /**
+   * Fine-grained configuration for Tier 2 fast-path resource blocking.
+   */
+  fastPathResourceBlockerOptions?: FastPathResourceBlockerOptions;
+}
+
+export type PlaywrightBrowserSessionPoolOptions<
+  TContext extends PlaywrightContextLike<any> = PlaywrightContextLike<PlaywrightPageLike>,
+  TPage = PlaywrightPageLike
+> = PlaywrightSessionPoolOptions<TContext, TPage>;
+
+export interface PlaywrightManagedSessionContext<
+  TContext = unknown,
+  TPage = unknown
+> extends ManagedSessionContext<TContext, TPage> {
+  hasRestoredSessionState?: boolean;
 }
 
 /**
@@ -93,7 +128,7 @@ export class PlaywrightBrowserSessionPool<
   private browser: PlaywrightBrowserLike<TContext, TPage> | null = null;
   private browserLaunchPromise: Promise<PlaywrightBrowserLike<TContext, TPage>> | null = null;
   private poolMutexTail: Promise<void> = Promise.resolve();
-  private readonly entries = new Map<string, ManagedSessionContext<TContext, TPage>>();
+  private readonly entries = new Map<string, PlaywrightManagedSessionContext<TContext, TPage>>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   private readonly sessionStateStore?: SessionStateStorePort<unknown>;
@@ -103,6 +138,7 @@ export class PlaywrightBrowserSessionPool<
   private readonly browserLauncher?: () => Promise<PlaywrightBrowserLike<TContext, TPage>>;
   private readonly initScriptCode?: string;
   private readonly contextOptions?: Record<string, unknown>;
+  private readonly fastPathResourceBlockerOptions?: FastPathResourceBlockerOptions;
   private readonly logger?: AuthLoggerPort;
 
   constructor(options: PlaywrightSessionPoolOptions<TContext, TPage> = {}) {
@@ -113,6 +149,7 @@ export class PlaywrightBrowserSessionPool<
     this.browserLauncher = options.browserLauncher;
     this.initScriptCode = options.initScriptCode;
     this.contextOptions = options.contextOptions;
+    this.fastPathResourceBlockerOptions = resolveFastPathResourceBlockerOptions(options);
     this.logger = options.logger ? createRedactingLogger(options.logger) : undefined;
 
     this.cleanupTimer = setInterval(() => {
@@ -195,14 +232,26 @@ export class PlaywrightBrowserSessionPool<
     return true;
   }
 
+  private async applyFastPathBlockerIfEnabled(page: TPage): Promise<void> {
+    if (!this.fastPathResourceBlockerOptions) {
+      return;
+    }
+    await ensureFastPathResourceBlockingInstalled(
+      page as unknown as PlaywrightPageLike,
+      this.fastPathResourceBlockerOptions,
+      this.logger
+    );
+  }
+
   private async persistEntryState(
-    entry: ManagedSessionContext<TContext, TPage>
+    entry: PlaywrightManagedSessionContext<TContext, TPage>
   ): Promise<void> {
     if (!this.sessionStateStore) return;
     const key = normalizeIdentityId(entry.userId);
     try {
       const state = await entry.context.storageState();
       await this.sessionStateStore.saveSessionState(entry.userId, state);
+      entry.hasRestoredSessionState = true;
     } catch (err) {
       this.logger?.warn(
         `Failed to persist storageState for user ${key}: ${redactSensitiveErrorText(err)}`
@@ -212,7 +261,7 @@ export class PlaywrightBrowserSessionPool<
 
   async acquireUserContext(
     userId: IdentityId
-  ): Promise<ManagedSessionContext<TContext, TPage>> {
+  ): Promise<PlaywrightManagedSessionContext<TContext, TPage>> {
     return this.withPoolMutex(async () => {
       const key = normalizeIdentityId(userId);
       const browser = await this.ensureBrowser();
@@ -238,15 +287,21 @@ export class PlaywrightBrowserSessionPool<
         ...this.contextOptions
       };
 
+      let hasRestoredSessionState = false;
       if (savedState && typeof savedState === 'object') {
         baseOptions.storageState = savedState;
+        hasRestoredSessionState = true;
       }
 
       let context: TContext;
       try {
         context = await browser.newContext(baseOptions);
-      } catch {
+      } catch (err) {
+        this.logger?.warn(
+          `Failed to restore persisted Playwright storageState for user ${key}; creating fresh BrowserContext: ${redactSensitiveErrorText(err)}`
+        );
         delete baseOptions.storageState;
+        hasRestoredSessionState = false;
         context = await browser.newContext(baseOptions);
       }
 
@@ -254,12 +309,15 @@ export class PlaywrightBrowserSessionPool<
       await context.addInitScript(scriptToInject);
 
       const primaryPage = await context.newPage();
-      const entry: ManagedSessionContext<TContext, TPage> = {
+      await this.applyFastPathBlockerIfEnabled(primaryPage);
+
+      const entry: PlaywrightManagedSessionContext<TContext, TPage> = {
         userId,
         context,
         primaryPage,
         lastActiveAt: Date.now(),
-        activeLocks: 1
+        activeLocks: 1,
+        hasRestoredSessionState
       };
       this.entries.set(key, entry);
       return entry;
@@ -274,7 +332,7 @@ export class PlaywrightBrowserSessionPool<
     }
   }
 
-  async getOrCreatePrimaryPage(
+  private async resolveOrCreateOpenPage(
     managed: ManagedSessionContext<TContext, TPage>
   ): Promise<TPage> {
     const pages = managed.context.pages();
@@ -294,6 +352,14 @@ export class PlaywrightBrowserSessionPool<
 
     const page = await managed.context.newPage();
     managed.primaryPage = page;
+    return page;
+  }
+
+  async getOrCreatePrimaryPage(
+    managed: ManagedSessionContext<TContext, TPage>
+  ): Promise<TPage> {
+    const page = await this.resolveOrCreateOpenPage(managed);
+    await this.applyFastPathBlockerIfEnabled(page);
     return page;
   }
 
