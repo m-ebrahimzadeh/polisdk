@@ -93,6 +93,17 @@ export interface PoliAuthDomDiagnosticSnapshot {
 }
 
 /**
+ * Closed taxonomy of semantic Politecnico di Milano Identity Provider failure codes.
+ */
+export type PolimiSemanticErrorCode =
+  | 'INVALID_CREDENTIALS'
+  | 'PASSWORD_EXPIRED'
+  | 'ACCOUNT_LOCKED'
+  | 'OTP_REJECTED'
+  | 'IDP_MAINTENANCE'
+  | 'DOM_SELECTOR_DRIFT';
+
+/**
  * Structured diagnostic error payload attached to `PoliAuthDiagnosticError` and outcomes.
  */
 export interface PoliAuthDiagnosticErrorPayload {
@@ -100,6 +111,7 @@ export interface PoliAuthDiagnosticErrorPayload {
   operation: string;
   stage: PoliAuthStage;
   classification: PoliAuthFailureClassification;
+  semanticErrorCode?: PolimiSemanticErrorCode;
   selectorOrEndpoint: string;
   message: string;
   diagnosticSnapshot?: PoliAuthDomDiagnosticSnapshot;
@@ -111,10 +123,12 @@ export interface PolimiFailureClassificationInput {
   operation: string;
   stage?: PoliAuthStage;
   url?: string;
+  title?: string;
   pathname?: string;
   httpStatus?: number;
   selectorOrEndpoint?: string;
   error?: unknown;
+  errorMessage?: string;
   diagnosticSnapshot?: PoliAuthDomDiagnosticSnapshot;
   extraSecrets?: string[];
   customRules?: RedactionRule[];
@@ -157,6 +171,9 @@ export function sanitizeDiagnosticErrorPayload(
     operation: redactSecrets(payload.operation, extraSecrets, customRules),
     stage: payload.stage,
     classification: payload.classification,
+    ...(payload.semanticErrorCode !== undefined
+      ? { semanticErrorCode: payload.semanticErrorCode }
+      : {}),
     selectorOrEndpoint: redactSecrets(payload.selectorOrEndpoint, extraSecrets, customRules),
     message: redactSecrets(payload.message, extraSecrets, customRules),
     ...(sanitizedSnapshot ? { diagnosticSnapshot: sanitizedSnapshot } : {}),
@@ -248,55 +265,50 @@ export function classifyPolimiFailure(
       } else {
         message = `PoliMi network or transport error during ${input.operation}${rawCause ? `: ${rawCause}` : '.'}`;
       }
-    } else if (
-      (stage === 'otp' && snapshot?.hasErrorBanner) ||
-      /otp rejected|2fa otp rejected|2fa manual otp exceeded/i.test(lowerCause)
-    ) {
-      classification = 'OTP_CHALLENGE_FAILED';
-      message =
-        snapshot?.errorMessage ||
-        rawCause ||
-        'PoliMi 2FA OTP challenge was rejected.';
-    } else if (
-      (stage === 'credentials' && snapshot?.hasErrorBanner) ||
-      /login rejected|invalid credentials|credenziali non valide/i.test(lowerCause)
-    ) {
-      classification = 'AUTHENTICATION_REJECTED';
-      message =
-        snapshot?.errorMessage ||
-        rawCause ||
-        'PoliMi credentials were rejected by Identity Provider.';
     } else {
-      // 3. Deterministic DOM Selector Drift check
-      const hostname = extractHostnameSafe(snapshot?.url || input.url);
-      const isExpectedIdpHost = isExpectedPolimiIdpHostname(hostname);
-      const hasRuntimeEvalFailure = /evalerror|typeerror|referenceerror|syntaxerror/i.test(
-        lowerCause
-      );
-      const isOkOrNoTransportError =
-        !hasRuntimeEvalFailure &&
-        (effectiveHttpStatus === undefined || effectiveHttpStatus === 200);
-      const isCleanPopulatedDom =
-        snapshot !== undefined &&
-        snapshot.hasEmptyBody === false &&
-        snapshot.hasMaintenanceBanner === false &&
-        snapshot.hasErrorBanner === false;
-      const isMissingStageSelectorFailure =
-        (input.operation === 'submitCredentials' ||
-          input.operation === 'submitOtp' ||
-          input.operation === 'recoverSessionPage') &&
-        (effectiveHttpStatus === undefined || effectiveHttpStatus === 200) &&
-        snapshot !== undefined &&
-        snapshot.hasEmptyBody === false &&
-        snapshot.hasMaintenanceBanner === false &&
-        snapshot.hasErrorBanner === false;
+      const semanticFromContext = classifyPolimiSemanticError({
+        ...input,
+        stage,
+        diagnosticSnapshot: snapshot
+      });
 
-      if (
-        isExpectedIdpHost &&
-        isOkOrNoTransportError &&
-        isCleanPopulatedDom &&
-        (stage === 'unknown' || isMissingStageSelectorFailure)
-      ) {
+      if (semanticFromContext === 'IDP_MAINTENANCE') {
+        classification = 'PORTAL_OUTAGE_OR_NETWORK_ERROR';
+        message =
+          snapshot?.errorMessage ||
+          input.errorMessage ||
+          rawCause ||
+          'PoliMi Identity Provider maintenance or outage detected.';
+      } else if (semanticFromContext === 'ACCOUNT_LOCKED') {
+        classification = 'AUTHENTICATION_REJECTED';
+        message =
+          snapshot?.errorMessage ||
+          input.errorMessage ||
+          rawCause ||
+          'PoliMi account is locked or suspended.';
+      } else if (semanticFromContext === 'PASSWORD_EXPIRED') {
+        classification = 'AUTHENTICATION_REJECTED';
+        message =
+          snapshot?.errorMessage ||
+          input.errorMessage ||
+          rawCause ||
+          'PoliMi password has expired and must be changed.';
+      } else if (semanticFromContext === 'OTP_REJECTED') {
+        classification = 'OTP_CHALLENGE_FAILED';
+        message =
+          snapshot?.errorMessage ||
+          input.errorMessage ||
+          rawCause ||
+          'PoliMi 2FA OTP challenge was rejected.';
+      } else if (semanticFromContext === 'INVALID_CREDENTIALS') {
+        classification = 'AUTHENTICATION_REJECTED';
+        message =
+          snapshot?.errorMessage ||
+          input.errorMessage ||
+          rawCause ||
+          'PoliMi credentials were rejected by Identity Provider.';
+      } else if (semanticFromContext === 'DOM_SELECTOR_DRIFT') {
+        const hostname = extractHostnameSafe(snapshot?.url || input.url);
         classification = 'DOM_SELECTOR_DRIFT';
         message = `PoliMi DOM selector drift detected on ${hostname} during ${input.operation} (expected ${selectorOrEndpoint} on populated HTTP ${String(effectiveHttpStatus ?? 200)} page).`;
       } else if (stage === 'otp' && input.operation === 'submitOtp') {
@@ -309,12 +321,26 @@ export function classifyPolimiFailure(
     }
   }
 
+  let semanticErrorCode: PolimiSemanticErrorCode | undefined;
+  if (classification === 'PORTAL_OUTAGE_OR_NETWORK_ERROR') {
+    semanticErrorCode = 'IDP_MAINTENANCE';
+  } else if (classification === 'DOM_SELECTOR_DRIFT') {
+    semanticErrorCode = 'DOM_SELECTOR_DRIFT';
+  } else if (classification !== 'TARGET_CLOSED') {
+    semanticErrorCode = classifyPolimiSemanticError({
+      ...input,
+      stage,
+      diagnosticSnapshot: snapshot
+    });
+  }
+
   return sanitizeDiagnosticErrorPayload(
     {
       component,
       operation: input.operation,
       stage,
       classification,
+      ...(semanticErrorCode ? { semanticErrorCode } : {}),
       selectorOrEndpoint,
       message,
       ...(snapshot ? { diagnosticSnapshot: snapshot } : {}),
@@ -323,6 +349,137 @@ export function classifyPolimiFailure(
     extraSecrets,
     customRules
   );
+}
+
+/**
+ * Classifies an IdP failure or diagnostic snapshot into a closed semantic error code.
+ */
+export function classifyPolimiSemanticError(
+  input: Omit<PolimiFailureClassificationInput, 'operation'> & {
+    operation?: string;
+    stage?: PoliAuthStage;
+  }
+): PolimiSemanticErrorCode | undefined {
+  const snapshot = input.diagnosticSnapshot;
+  const stage: PoliAuthStage = input.stage ?? 'unknown';
+  const operation = input.operation ?? '';
+  const rawCause =
+    input.error instanceof Error
+      ? input.error.message
+      : typeof input.error === 'string'
+        ? input.error
+        : input.error !== undefined && input.error !== null
+          ? String(input.error)
+          : '';
+  const lowerCause = rawCause.toLowerCase();
+  const effectiveHttpStatus = input.httpStatus ?? snapshot?.httpStatus;
+
+  if (
+    /target closed|target page, context or browser has been closed|browser has been closed|session closed|target_closed/i.test(
+      lowerCause
+    ) &&
+    (effectiveHttpStatus === undefined || effectiveHttpStatus < 500)
+  ) {
+    return undefined;
+  }
+
+  const bannerErrorText = (snapshot?.errorMessage ?? input.errorMessage ?? '').trim();
+  const combinedErrorText = `${bannerErrorText} ${rawCause}`.toLowerCase();
+  const combinedAllText = `${bannerErrorText} ${input.title ?? ''} ${rawCause}`.toLowerCase();
+
+  // 1. Portal Maintenance / Outage / Empty Body / Network Error
+  const isMaintenanceHttp =
+    effectiveHttpStatus !== undefined &&
+    (POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.httpStatusCodes as readonly number[]).includes(
+      effectiveHttpStatus
+    );
+  const isMaintenanceNet = POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.networkErrorPatterns.some(
+    (pattern) => lowerCause.includes(pattern.toLowerCase())
+  );
+  const isMaintenanceText = POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.textPatterns.some(
+    (pattern) => combinedAllText.includes(pattern.toLowerCase())
+  );
+  if (
+    isMaintenanceHttp ||
+    isMaintenanceNet ||
+    snapshot?.hasMaintenanceBanner === true ||
+    snapshot?.hasEmptyBody === true ||
+    isMaintenanceText
+  ) {
+    return 'IDP_MAINTENANCE';
+  }
+
+  // 2. Account Locked (detected at any stage)
+  if (
+    POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators.accountLockedPatterns.some((pattern) =>
+      combinedAllText.includes(pattern.toLowerCase())
+    )
+  ) {
+    return 'ACCOUNT_LOCKED';
+  }
+
+  // 3. Password Expired
+  if (
+    POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators.passwordExpiredPatterns.some((pattern) =>
+      combinedAllText.includes(pattern.toLowerCase())
+    )
+  ) {
+    return 'PASSWORD_EXPIRED';
+  }
+
+  const hasBannerError = snapshot?.hasErrorBanner === true || bannerErrorText.length > 0;
+
+  // 4. OTP Rejected (Stage 2 or explicit OTP rejection pattern)
+  if (
+    POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators.otpRejectedPatterns.some((pattern) =>
+      combinedErrorText.includes(pattern.toLowerCase())
+    ) ||
+    /otp rejected|2fa otp rejected|2fa manual otp exceeded/i.test(lowerCause) ||
+    (stage === 'otp' && hasBannerError)
+  ) {
+    return 'OTP_REJECTED';
+  }
+
+  // 5. Invalid Credentials (Stage 1 or explicit invalid-credentials pattern)
+  if (
+    POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators.invalidCredentialsPatterns.some((pattern) =>
+      combinedErrorText.includes(pattern.toLowerCase())
+    ) ||
+    /login rejected/i.test(lowerCause) ||
+    (stage === 'credentials' && hasBannerError)
+  ) {
+    return 'INVALID_CREDENTIALS';
+  }
+
+  // 6. DOM Selector Drift (populated HTTP 200 DOM on expected *.polimi.it IdP hostname)
+  const hostname = extractHostnameSafe(snapshot?.url || input.url);
+  const isExpectedIdpHost = isExpectedPolimiIdpHostname(hostname);
+  const hasRuntimeEvalFailure = /evalerror|typeerror|referenceerror|syntaxerror/i.test(lowerCause);
+  const isOkOrNoTransportError =
+    !hasRuntimeEvalFailure &&
+    (effectiveHttpStatus === undefined || effectiveHttpStatus === 200);
+  const isCleanPopulatedDom =
+    snapshot !== undefined &&
+    snapshot.hasEmptyBody === false &&
+    snapshot.hasMaintenanceBanner === false &&
+    !hasBannerError;
+  const isMissingStageSelectorFailure =
+    (operation === 'submitCredentials' ||
+      operation === 'submitOtp' ||
+      operation === 'recoverSessionPage') &&
+    isOkOrNoTransportError &&
+    isCleanPopulatedDom;
+
+  if (
+    isExpectedIdpHost &&
+    isOkOrNoTransportError &&
+    isCleanPopulatedDom &&
+    (stage === 'unknown' || isMissingStageSelectorFailure)
+  ) {
+    return 'DOM_SELECTOR_DRIFT';
+  }
+
+  return undefined;
 }
 
 /**
@@ -350,11 +507,13 @@ export interface PolimiStageInspectionResult {
   title: string;
   errorMessage?: string;
   httpStatus?: number;
+  semanticErrorCode?: PolimiSemanticErrorCode;
   diagnosticSnapshot?: PoliAuthDomDiagnosticSnapshot;
   diagnosticError?: PoliAuthDiagnosticErrorPayload;
 }
 
 export type StageInspectionResult = PolimiStageInspectionResult;
+export type PoliAuthStageInspectionResult = PolimiStageInspectionResult;
 
 /**
  * High-level status of an authentication flow.
@@ -367,7 +526,10 @@ export type LoginFlowStatus =
   | 'waiting_for_otp'
   | 'submitting_otp'
   | 'authenticated'
-  | 'failed';
+  | 'failed'
+  | 'reauth_required';
+
+export type UserLoginStatus = LoginFlowStatus;
 
 export const LOGIN_STATUS_LABELS: Record<LoginFlowStatus, string> = {
   idle: 'Idle',
@@ -377,7 +539,8 @@ export const LOGIN_STATUS_LABELS: Record<LoginFlowStatus, string> = {
   waiting_for_otp: 'Waiting for OTP',
   submitting_otp: 'Submitting OTP',
   authenticated: 'Authenticated',
-  failed: 'Login Failed'
+  failed: 'Login Failed',
+  reauth_required: 'Re-authentication Required'
 };
 
 /**

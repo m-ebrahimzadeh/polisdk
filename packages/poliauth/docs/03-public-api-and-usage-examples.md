@@ -188,3 +188,16 @@ const webexDriver = new ChromeExtensionTabDriver(activeTabId, {
 // Switch spec cleanly without rebuilding bundles or changing content scripts
 const webeepDriver = webexDriver.withFederatedProviderSpec(webeepSpec);
 ```
+
+---
+
+## 7. Semantic IdP Error Taxonomy & `reauth_required` Circuit Breaker (Spec Sec 7.1)
+
+`@polisdk/poliauth` exports `PolimiSemanticErrorCode` and `classifyPolimiSemanticError` (`INVALID_CREDENTIALS`, `PASSWORD_EXPIRED`, `ACCOUNT_LOCKED`, `OTP_REJECTED`, `IDP_MAINTENANCE`, `DOM_SELECTOR_DRIFT`) backed by `POLIMI_LOGIN_FLOW_SPEC.semanticErrorIndicators`.
+
+When `PoliAuth` (or `PoliAuthOrchestrator` / `CredentialSetupWizard`) is wired with `identityRepository` (`UserRepository` / `UserIdentityReaderPort & UserIdentityWriterPort`):
+1. **Pre-browser fast-fail**: Users in `loginStatus === 'reauth_required'` abort before any browser context is leased or `driver.goto()` is invoked (`reauthRequired: true`, `classification: 'AUTHENTICATION_REJECTED'`).
+2. **Stage 1 immediate terminal trip**: `INVALID_CREDENTIALS`, `PASSWORD_EXPIRED`, and `ACCOUNT_LOCKED` (at any stage) immediately set `loginStatus = 'reauth_required'` with zero retries.
+3. **Stage 2 `OTP_REJECTED` policy**: On 1st auto-TOTP rejection, status stays unchanged, the orchestrator waits for the next 30-second RFC 6238 TOTP window, and retries `submitOtp` once; a 2nd consecutive failure (or reaching `maxManualOtpAttempts`) trips `'reauth_required'`.
+4. **Maintenance & drift preservation**: `IDP_MAINTENANCE` (`PORTAL_OUTAGE_OR_NETWORK_ERROR`) and `DOM_SELECTOR_DRIFT` never mark a user `'reauth_required'`.
+5. **Credential reset**: Completing `CredentialSetupWizard` or calling `PoliAuth.saveCredentials(..., identityId)` resets `'reauth_required'` back to `'idle'` and clears `loginError`.

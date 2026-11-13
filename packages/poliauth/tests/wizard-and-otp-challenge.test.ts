@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { CredentialSetupWizard } from '../application/credential-wizard.js';
 import { OtpChallengeCoordinator } from '../application/otp-challenge.js';
 import { TotpService } from '../domain/totp.js';
+import { InMemoryUserIdentityRepository } from '../storage/memory-storage.js';
+import { PoliAuth } from '../src/poliauth-client.js';
 
 describe('CredentialSetupWizard & OtpChallengeCoordinator', () => {
   it('guides a user through all 4 steps of the interactive credential setup wizard with input validation', () => {
@@ -102,5 +104,57 @@ describe('CredentialSetupWizard & OtpChallengeCoordinator', () => {
     // 3. Timeout expiration
     const timeoutWaiter = coordinator.waitForManualOtp(503, 30);
     await expect(timeoutWaiter).rejects.toThrow(/Timed out/i);
+  });
+
+  it('resets loginStatus from reauth_required back to idle and clears loginError upon wizard completion and PoliAuth.saveCredentials', async () => {
+    const users = new InMemoryUserIdentityRepository();
+    await users.ensureUser(8001, { username: 'mario.rossi' });
+    await users.updateLoginStatus(
+      8001,
+      'reauth_required',
+      'PoliMi login rejected: Credenziali non valide'
+    );
+
+    const wizard = new CredentialSetupWizard({ identityRepository: users });
+    wizard.startSession(8001);
+    wizard.submitStepInput(8001, '10987654');
+    wizard.submitStepInput(8001, 'FreshPoliPass!');
+    wizard.submitStepInput(8001, 'mario.rossi@mail.polimi.it');
+    const doneTotp = wizard.submitStepInput(8001, 'JBSWY3DPEHPK3PXP');
+    expect(doneTotp?.status).toBe('completed');
+
+    const afterTotpWizard = await users.getUser(8001);
+    expect(afterTotpWizard?.loginStatus).toBe('idle');
+    expect(afterTotpWizard?.loginError).toBeNull();
+
+    // Also test skipTotpStep path
+    await users.updateLoginStatus(8001, 'reauth_required', 'Password expired');
+    wizard.startSession(8001);
+    wizard.submitStepInput(8001, '10987654');
+    wizard.submitStepInput(8001, 'AnotherPass!');
+    wizard.submitStepInput(8001, 'mario.rossi@mail.polimi.it');
+    const doneSkip = wizard.skipTotpStep(8001);
+    expect(doneSkip?.status).toBe('completed');
+
+    const afterSkipWizard = await users.getUser(8001);
+    expect(afterSkipWizard?.loginStatus).toBe('idle');
+    expect(afterSkipWizard?.loginError).toBeNull();
+
+    // Also test PoliAuth.saveCredentials resetting reauth_required
+    const client = new PoliAuth({ identityRepository: users });
+    await users.updateLoginStatus(8001, 'reauth_required', 'Invalid credentials');
+    await client.saveCredentials(
+      {
+        personCode: '10987654',
+        password: 'FixedPassword!',
+        polimiEmail: 'mario.rossi@mail.polimi.it',
+        totpSecret: 'JBSWY3DPEHPK3PXP'
+      },
+      8001
+    );
+
+    const afterSave = await users.getUser(8001);
+    expect(afterSave?.loginStatus).toBe('idle');
+    expect(afterSave?.loginError).toBeNull();
   });
 });

@@ -8,14 +8,18 @@
 
 import {
   classifyPolimiFailure,
+  classifyPolimiSemanticError,
   PoliAuthDiagnosticError,
   type IdentityId,
   type LoginCredentials,
   type LoginFlowStatus,
   type PoliAuthDiagnosticErrorPayload,
-  type PoliAuthFailureClassification
+  type PoliAuthFailureClassification,
+  type PolimiSemanticErrorCode,
+  type PolimiStageInspectionResult
 } from '../domain/entities.js';
 import { redactSensitiveErrorText } from '../domain/redaction.js';
+import { getTotpRemainingSeconds } from '../domain/totp.js';
 import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
 import type {
   AuthPageDriverPort,
@@ -27,7 +31,100 @@ import type {
   LoginProgressCallbacks,
   OtpChallengeProviderPort
 } from '../interfaces/otp-provider-port.js';
+import type {
+  UserIdentityReaderPort,
+  UserIdentityWriterPort
+} from '../interfaces/storage-port.js';
 import { createRedactingLogger } from './redacting-logger.js';
+
+export type PoliAuthIdentityRepository = Partial<
+  UserIdentityReaderPort & UserIdentityWriterPort
+>;
+
+export interface PoliAuthOrchestratorDependencies {
+  otpCoordinator: OtpChallengeProviderPort;
+  logger?: AuthLoggerPort;
+  identityRepository?: PoliAuthIdentityRepository;
+}
+
+export type PoliAuthOrchestratorOptions = Omit<
+  PoliAuthOrchestratorDependencies,
+  'otpCoordinator'
+>;
+
+function isAuthLoggerPort(value: unknown): value is AuthLoggerPort {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    ('debug' in value || 'info' in value || 'warn' in value || 'error' in value)
+  );
+}
+
+function isStage1TerminalSemanticError(
+  code: PolimiSemanticErrorCode | undefined
+): code is 'INVALID_CREDENTIALS' | 'PASSWORD_EXPIRED' | 'ACCOUNT_LOCKED' {
+  return (
+    code === 'INVALID_CREDENTIALS' ||
+    code === 'PASSWORD_EXPIRED' ||
+    code === 'ACCOUNT_LOCKED'
+  );
+}
+
+function resolveStageSemanticError(
+  stageInfo: PolimiStageInspectionResult,
+  operation: string
+): PolimiSemanticErrorCode | undefined {
+  if (stageInfo.semanticErrorCode) {
+    return stageInfo.semanticErrorCode;
+  }
+  if (stageInfo.diagnosticError?.semanticErrorCode) {
+    return stageInfo.diagnosticError.semanticErrorCode;
+  }
+  if (
+    stageInfo.errorMessage ||
+    stageInfo.diagnosticSnapshot ||
+    (stageInfo.httpStatus !== undefined && stageInfo.httpStatus >= 500)
+  ) {
+    return classifyPolimiSemanticError({
+      operation,
+      stage: stageInfo.stage,
+      url: stageInfo.url,
+      httpStatus: stageInfo.httpStatus,
+      errorMessage: stageInfo.errorMessage,
+      diagnosticSnapshot: stageInfo.diagnosticSnapshot
+    });
+  }
+  return undefined;
+}
+
+async function waitForNextTotpWindowBoundary(options: {
+  pollIntervalMs: number;
+  nextTotpWindowWaitMs?: number;
+  waitForNextTotpWindow?: (waitMs: number) => Promise<void>;
+  logger?: AuthLoggerPort;
+}): Promise<void> {
+  const computedWaitMs = getTotpRemainingSeconds(Date.now(), 30) * 1000 + 250;
+  const requestedWaitMs =
+    options.nextTotpWindowWaitMs !== undefined
+      ? Math.max(0, options.nextTotpWindowWaitMs)
+      : computedWaitMs;
+  options.logger?.warn(
+    `PoliMi 2FA auto-TOTP rejected; waiting ${requestedWaitMs}ms for next 30s RFC 6238 window before single retry.`
+  );
+  if (options.waitForNextTotpWindow) {
+    await options.waitForNextTotpWindow(requestedWaitMs);
+    return;
+  }
+  if (options.nextTotpWindowWaitMs !== undefined) {
+    await sleep(requestedWaitMs);
+    return;
+  }
+  if (options.pollIntervalMs > 0) {
+    await sleep(computedWaitMs);
+    return;
+  }
+  await sleep(0);
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -84,6 +181,10 @@ export interface PolimiSessionAuthRequest {
    * credentials or OTP before retrying/falling back. Defaults to `1500` when `pollDelayMs > 0` (`0` otherwise).
    */
   postSubmitDebounceMs?: number;
+  /** Optional explicit override for next-window wait duration after 1st `OTP_REJECTED` (ms). */
+  nextTotpWindowWaitMs?: number;
+  /** Optional hook overriding the wait for the next 30s TOTP window on `OTP_REJECTED` retry. */
+  waitForNextTotpWindow?: (waitMs: number) => Promise<void>;
   /** Optional callbacks for live status updates. */
   callbacks?: LoginProgressCallbacks;
   /** Optional hook invoked once an authenticated PoliMi session is established. */
@@ -96,6 +197,8 @@ export interface PolimiSessionAuthOutcome {
   url?: string;
   error?: string;
   classification?: PoliAuthFailureClassification;
+  semanticErrorCode?: PolimiSemanticErrorCode;
+  reauthRequired?: boolean;
   diagnostic?: PoliAuthDiagnosticErrorPayload;
 }
 
@@ -128,15 +231,21 @@ export interface FederatedSamlAuthRequest {
    * credentials or OTP during SAML SSO. Defaults to `1500` when `pollIntervalMs > 0` (`0` otherwise).
    */
   postSubmitDebounceMs?: number;
+  /** Optional explicit override for next-window wait duration after 1st `OTP_REJECTED` (ms). */
+  nextTotpWindowWaitMs?: number;
+  /** Optional hook overriding the wait for the next 30s TOTP window on `OTP_REJECTED` retry. */
+  waitForNextTotpWindow?: (waitMs: number) => Promise<void>;
   callbacks?: LoginProgressCallbacks;
   onAuthenticated?: () => void | Promise<void>;
 }
 
 export interface FederatedSamlAuthOutcome {
   ok: boolean;
-  status: 'authenticated' | 'waiting_for_login' | 'failed';
+  status: 'authenticated' | 'waiting_for_login' | 'failed' | 'reauth_required';
   error?: string;
   classification?: PoliAuthFailureClassification;
+  semanticErrorCode?: PolimiSemanticErrorCode;
+  reauthRequired?: boolean;
   diagnostic?: PoliAuthDiagnosticErrorPayload;
 }
 
@@ -148,19 +257,82 @@ export interface FederatedSamlFlowState {
   submittedSamlCredentialsCount: number;
   submittedSamlAutoTotpCount: number;
   submittedSamlManualOtpCount: number;
+  retriedSamlAutoTotpNextWindow?: boolean;
   explicitOtpToConsume?: string;
   credentialsDebounceUntil?: number;
   otpDebounceUntil?: number;
 }
 
 export class PoliAuthOrchestrator {
+  private readonly otpCoordinator: OtpChallengeProviderPort;
   private readonly logger?: AuthLoggerPort;
+  private readonly identityRepository?: PoliAuthIdentityRepository;
 
+  constructor(dependencies: PoliAuthOrchestratorDependencies);
   constructor(
-    private readonly otpCoordinator: OtpChallengeProviderPort,
-    logger?: AuthLoggerPort
+    otpCoordinator: OtpChallengeProviderPort,
+    loggerOrOptions?: AuthLoggerPort | PoliAuthOrchestratorOptions
+  );
+  constructor(
+    otpCoordinatorOrDeps: OtpChallengeProviderPort | PoliAuthOrchestratorDependencies,
+    loggerOrOptions?: AuthLoggerPort | PoliAuthOrchestratorOptions
   ) {
-    this.logger = logger ? createRedactingLogger(logger) : undefined;
+    if ('otpCoordinator' in otpCoordinatorOrDeps) {
+      this.otpCoordinator = otpCoordinatorOrDeps.otpCoordinator;
+      this.logger = otpCoordinatorOrDeps.logger
+        ? createRedactingLogger(otpCoordinatorOrDeps.logger)
+        : undefined;
+      this.identityRepository = otpCoordinatorOrDeps.identityRepository;
+    } else {
+      this.otpCoordinator = otpCoordinatorOrDeps;
+      if (isAuthLoggerPort(loggerOrOptions)) {
+        this.logger = createRedactingLogger(loggerOrOptions);
+        this.identityRepository = undefined;
+      } else {
+        this.logger = loggerOrOptions?.logger
+          ? createRedactingLogger(loggerOrOptions.logger)
+          : undefined;
+        this.identityRepository = loggerOrOptions?.identityRepository;
+      }
+    }
+  }
+
+  private async checkPreBrowserCircuitBreaker(userId: IdentityId): Promise<string | null> {
+    if (!userId || !this.identityRepository?.getUser) {
+      return null;
+    }
+    const existingUser = await this.identityRepository.getUser(userId);
+    if (existingUser?.loginStatus !== 'reauth_required') {
+      return null;
+    }
+    const reason = existingUser.loginError
+      ? `PoliMi login blocked by reauth_required circuit breaker: ${existingUser.loginError}. Update credentials to reset account status.`
+      : 'PoliMi login blocked by reauth_required circuit breaker. Update credentials to reset account status.';
+    const safeReason = redactSensitiveErrorText(reason);
+    this.logger?.warn(`Pre-browser circuit breaker fast-fail for user ${String(userId)}: ${safeReason}`);
+    return safeReason;
+  }
+
+  private async tripCircuitBreaker(
+    userId: IdentityId,
+    semanticErrorCode: PolimiSemanticErrorCode | undefined,
+    errorMessage: string
+  ): Promise<boolean> {
+    if (
+      semanticErrorCode === 'IDP_MAINTENANCE' ||
+      semanticErrorCode === 'DOM_SELECTOR_DRIFT' ||
+      !semanticErrorCode
+    ) {
+      return false;
+    }
+    const safeError = redactSensitiveErrorText(errorMessage);
+    this.logger?.warn(
+      `Tripping reauth_required circuit breaker (${semanticErrorCode}) for user ${String(userId)}: ${safeError}`
+    );
+    if (userId && this.identityRepository?.updateLoginStatus) {
+      await this.identityRepository.updateLoginStatus(userId, 'reauth_required', safeError);
+    }
+    return true;
   }
 
   /**
@@ -179,6 +351,8 @@ export class PoliAuthOrchestrator {
       pollDelayMs = 400,
       maxManualOtpAttempts = 3,
       postSubmitDebounceMs = pollDelayMs > 0 ? Math.max(1_500, pollDelayMs * 3) : 0,
+      nextTotpWindowWaitMs,
+      waitForNextTotpWindow,
       callbacks,
       onAuthenticated
     } = req;
@@ -190,6 +364,18 @@ export class PoliAuthOrchestrator {
     };
 
     try {
+      const breakerReason = await this.checkPreBrowserCircuitBreaker(userId);
+      if (breakerReason) {
+        await notify('reauth_required', breakerReason);
+        return {
+          ok: false,
+          status: 'reauth_required',
+          error: breakerReason,
+          classification: 'AUTHENTICATION_REJECTED',
+          reauthRequired: true
+        };
+      }
+
       const initialStage = await driver
         .inspectPolimiStage()
         .catch((err) => {
@@ -216,6 +402,8 @@ export class PoliAuthOrchestrator {
       let submittedCredentialsCount = 0;
       let submittedAutoTotpCount = 0;
       let submittedManualOtpCount = 0;
+      let autoTotpNextWindowRetried = false;
+      let retryAutoTotpPending = false;
       let credentialsDebounceUntil = 0;
       let otpDebounceUntil = 0;
       let explicitOtpToConsume = credentials.otp?.trim() || '';
@@ -248,6 +436,66 @@ export class PoliAuthOrchestrator {
           };
         }
 
+        // 1.5 Global Semantic Outage / Account Lockout / Expired Password Gate (any stage)
+        const stageSemantic = resolveStageSemanticError(stageInfo, 'inspectPolimiPageStage');
+        if (stageSemantic === 'ACCOUNT_LOCKED' || stageSemantic === 'PASSWORD_EXPIRED') {
+          const errMsg =
+            stageInfo.errorMessage ||
+            stageInfo.diagnosticError?.message ||
+            (stageSemantic === 'ACCOUNT_LOCKED'
+              ? 'PoliMi account is locked or suspended.'
+              : 'PoliMi password has expired and must be changed.');
+          const diagnostic = classifyPolimiFailure({
+            component: '@polisdk/poliauth/application/login-orchestrator',
+            operation: 'inspectPolimiPageStage',
+            stage: stageInfo.stage,
+            url: stageInfo.url,
+            httpStatus: stageInfo.httpStatus,
+            errorMessage: stageInfo.errorMessage ?? errMsg,
+            diagnosticSnapshot: stageInfo.diagnosticSnapshot,
+            error: errMsg
+          });
+          await this.tripCircuitBreaker(userId, stageSemantic, errMsg);
+          await notify('failed', errMsg);
+          return {
+            ok: false,
+            status: 'failed',
+            url: stageInfo.url,
+            error: errMsg,
+            classification: diagnostic.classification,
+            semanticErrorCode: stageSemantic,
+            reauthRequired: true,
+            diagnostic
+          };
+        }
+
+        if (stageSemantic === 'IDP_MAINTENANCE') {
+          const diag =
+            stageInfo.diagnosticError ??
+            classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'inspectPolimiPageStage',
+              stage: stageInfo.stage,
+              url: stageInfo.url,
+              httpStatus: stageInfo.httpStatus,
+              errorMessage: stageInfo.errorMessage,
+              diagnosticSnapshot: stageInfo.diagnosticSnapshot,
+              error: stageInfo.errorMessage || 'PoliMi Identity Provider maintenance detected.'
+            });
+          this.logger?.warn(`PoliMi outage detected: ${diag.message}`, diag);
+          await notify('failed', diag.message);
+          return {
+            ok: false,
+            status: 'failed',
+            url: stageInfo.url,
+            error: diag.message,
+            classification: diag.classification,
+            semanticErrorCode: 'IDP_MAINTENANCE',
+            reauthRequired: false,
+            diagnostic: diag
+          };
+        }
+
         // 2. Session expired or bare /aunicalogin/ security violation recovery
         if (stageInfo.stage === 'session_expired') {
           await notify('recovering_session', 'Recovering expired PoliMi session...');
@@ -267,9 +515,15 @@ export class PoliAuthOrchestrator {
               stage: 'credentials',
               url: stageInfo.url,
               httpStatus: stageInfo.httpStatus,
+              errorMessage: stageInfo.errorMessage,
               diagnosticSnapshot: stageInfo.diagnosticSnapshot,
               error: errMsg
             });
+            const semanticErrorCode =
+              diagnostic.semanticErrorCode ?? stageSemantic ?? 'INVALID_CREDENTIALS';
+            const tripped = isStage1TerminalSemanticError(semanticErrorCode)
+              ? await this.tripCircuitBreaker(userId, semanticErrorCode, errMsg)
+              : false;
             await notify('failed', errMsg);
             return {
               ok: false,
@@ -277,6 +531,8 @@ export class PoliAuthOrchestrator {
               url: stageInfo.url,
               error: errMsg,
               classification: diagnostic.classification,
+              semanticErrorCode,
+              reauthRequired: tripped,
               diagnostic
             };
           }
@@ -300,9 +556,14 @@ export class PoliAuthOrchestrator {
               stage: 'credentials',
               url: stageInfo.url,
               httpStatus: stageInfo.httpStatus,
+              errorMessage: stageInfo.errorMessage,
               diagnosticSnapshot: stageInfo.diagnosticSnapshot,
               error: errMsg
             });
+            const semanticErrorCode = diagnostic.semanticErrorCode;
+            const tripped = isStage1TerminalSemanticError(semanticErrorCode)
+              ? await this.tripCircuitBreaker(userId, semanticErrorCode, errMsg)
+              : false;
             await notify('failed', errMsg);
             return {
               ok: false,
@@ -310,6 +571,8 @@ export class PoliAuthOrchestrator {
               url: stageInfo.url,
               error: errMsg,
               classification: diagnostic.classification,
+              ...(semanticErrorCode ? { semanticErrorCode } : {}),
+              reauthRequired: tripped,
               diagnostic
             };
           }
@@ -333,6 +596,9 @@ export class PoliAuthOrchestrator {
               url: stageInfo.url,
               error: errMsg,
               classification: diagnostic.classification,
+              ...(diagnostic.semanticErrorCode
+                ? { semanticErrorCode: diagnostic.semanticErrorCode }
+                : {}),
               diagnostic
             };
           }
@@ -360,6 +626,10 @@ export class PoliAuthOrchestrator {
                 error: credResult.error || 'Failed to submit PoliMi credentials.'
               });
             const errMsg = credResult.error || diagnostic.message;
+            const semanticErrorCode = diagnostic.semanticErrorCode;
+            const tripped = isStage1TerminalSemanticError(semanticErrorCode)
+              ? await this.tripCircuitBreaker(userId, semanticErrorCode, errMsg)
+              : false;
             await notify('failed', errMsg);
             return {
               ok: false,
@@ -367,6 +637,8 @@ export class PoliAuthOrchestrator {
               url: stageInfo.url,
               error: errMsg,
               classification: diagnostic.classification,
+              ...(semanticErrorCode ? { semanticErrorCode } : {}),
+              reauthRequired: tripped,
               diagnostic
             };
           }
@@ -390,9 +662,12 @@ export class PoliAuthOrchestrator {
               stage: 'otp',
               url: stageInfo.url,
               httpStatus: stageInfo.httpStatus,
+              errorMessage: stageInfo.errorMessage,
               diagnosticSnapshot: stageInfo.diagnosticSnapshot,
               error: errMsg
             });
+            const semanticErrorCode = diagnostic.semanticErrorCode ?? 'OTP_REJECTED';
+            const tripped = await this.tripCircuitBreaker(userId, semanticErrorCode, errMsg);
             await notify('failed', errMsg);
             return {
               ok: false,
@@ -400,8 +675,52 @@ export class PoliAuthOrchestrator {
               url: stageInfo.url,
               error: errMsg,
               classification: diagnostic.classification,
+              semanticErrorCode,
+              reauthRequired: tripped,
               diagnostic
             };
+          }
+
+          if (submittedAutoTotpCount > 0 && stageInfo.errorMessage) {
+            const errMsg = `PoliMi 2FA OTP rejected: ${stageInfo.errorMessage}`;
+            const diagnostic = classifyPolimiFailure({
+              component: '@polisdk/poliauth/application/login-orchestrator',
+              operation: 'submitOtp',
+              stage: 'otp',
+              url: stageInfo.url,
+              httpStatus: stageInfo.httpStatus,
+              errorMessage: stageInfo.errorMessage,
+              diagnosticSnapshot: stageInfo.diagnosticSnapshot,
+              error: errMsg
+            });
+            const semanticErrorCode = diagnostic.semanticErrorCode ?? 'OTP_REJECTED';
+            if (
+              submittedAutoTotpCount === 1 &&
+              !autoTotpNextWindowRetried &&
+              semanticErrorCode === 'OTP_REJECTED'
+            ) {
+              autoTotpNextWindowRetried = true;
+              retryAutoTotpPending = true;
+              await waitForNextTotpWindowBoundary({
+                pollIntervalMs: pollDelayMs,
+                nextTotpWindowWaitMs,
+                waitForNextTotpWindow,
+                logger: this.logger
+              });
+            } else {
+              const tripped = await this.tripCircuitBreaker(userId, semanticErrorCode, errMsg);
+              await notify('failed', errMsg);
+              return {
+                ok: false,
+                status: 'failed',
+                url: stageInfo.url,
+                error: errMsg,
+                classification: diagnostic.classification,
+                semanticErrorCode,
+                reauthRequired: tripped,
+                diagnostic
+              };
+            }
           }
 
           if (
@@ -424,9 +743,12 @@ export class PoliAuthOrchestrator {
               stage: 'otp',
               url: stageInfo.url,
               httpStatus: stageInfo.httpStatus,
+              errorMessage: stageInfo.errorMessage,
               diagnosticSnapshot: stageInfo.diagnosticSnapshot,
               error: errMsg
             });
+            const semanticErrorCode = diagnostic.semanticErrorCode ?? 'OTP_REJECTED';
+            const tripped = await this.tripCircuitBreaker(userId, semanticErrorCode, errMsg);
             await notify('failed', errMsg);
             return {
               ok: false,
@@ -434,6 +756,8 @@ export class PoliAuthOrchestrator {
               url: stageInfo.url,
               error: errMsg,
               classification: diagnostic.classification,
+              semanticErrorCode,
+              reauthRequired: tripped,
               diagnostic
             };
           }
@@ -444,10 +768,12 @@ export class PoliAuthOrchestrator {
             explicitOtpToConsume = '';
             submittedManualOtpCount += 1;
           } else {
+            const allowAutoTotp = submittedAutoTotpCount === 0 || retryAutoTotpPending;
+            retryAutoTotpPending = false;
             const otpChoice = await this.otpCoordinator.obtainOtpCodeForUser(
               userId,
               credentials.totpSecret,
-              submittedAutoTotpCount === 0,
+              allowAutoTotp,
               callbacks
             );
             otpToSubmit = otpChoice.otp;
@@ -475,6 +801,14 @@ export class PoliAuthOrchestrator {
                 error: otpResult.error || 'Failed to submit 2FA OTP.'
               });
             const errMsg = otpResult.error || diagnostic.message;
+            const semanticErrorCode = diagnostic.semanticErrorCode;
+            const shouldTripOtpFailure =
+              isStage1TerminalSemanticError(semanticErrorCode) ||
+              (semanticErrorCode === 'OTP_REJECTED' &&
+                (submittedManualOtpCount > 0 || submittedAutoTotpCount >= 2));
+            const tripped = shouldTripOtpFailure
+              ? await this.tripCircuitBreaker(userId, semanticErrorCode, errMsg)
+              : false;
             await notify('failed', errMsg);
             return {
               ok: false,
@@ -482,6 +816,8 @@ export class PoliAuthOrchestrator {
               url: stageInfo.url,
               error: errMsg,
               classification: diagnostic.classification,
+              ...(semanticErrorCode ? { semanticErrorCode } : {}),
+              reauthRequired: tripped,
               diagnostic
             };
           }
@@ -514,6 +850,8 @@ export class PoliAuthOrchestrator {
             url: stageInfo.url,
             error: diag.message,
             classification: diag.classification,
+            ...(diag.semanticErrorCode ? { semanticErrorCode: diag.semanticErrorCode } : {}),
+            reauthRequired: false,
             diagnostic: diag
           };
         }
@@ -532,6 +870,10 @@ export class PoliAuthOrchestrator {
     } catch (err) {
       const diagnostic = extractDiagnosticFromError(err, 'authenticate', entryUrl);
       const msg = diagnostic.message || redactSensitiveErrorText(err);
+      const semanticErrorCode = diagnostic.semanticErrorCode;
+      const tripped = isStage1TerminalSemanticError(semanticErrorCode)
+        ? await this.tripCircuitBreaker(userId, semanticErrorCode, msg)
+        : false;
       this.logger?.error(`PoliMi authentication failed: ${msg}`, diagnostic);
       await notify('failed', msg);
       return {
@@ -539,6 +881,8 @@ export class PoliAuthOrchestrator {
         status: 'failed',
         error: msg,
         classification: diagnostic.classification,
+        ...(semanticErrorCode ? { semanticErrorCode } : {}),
+        reauthRequired: tripped,
         diagnostic
       };
     }
@@ -559,6 +903,9 @@ export class PoliAuthOrchestrator {
     ssoTransitWindowMs?: number;
     maxManualOtpAttempts?: number;
     postSubmitDebounceMs?: number;
+    pollIntervalMs?: number;
+    nextTotpWindowWaitMs?: number;
+    waitForNextTotpWindow?: (waitMs: number) => Promise<void>;
     callbacks?: LoginProgressCallbacks;
   }): Promise<
     | { action: 'continue_polling' }
@@ -567,12 +914,16 @@ export class PoliAuthOrchestrator {
         action: 'login_required';
         reason: string;
         classification?: PoliAuthFailureClassification;
+        semanticErrorCode?: PolimiSemanticErrorCode;
+        reauthRequired?: boolean;
         diagnostic?: PoliAuthDiagnosticErrorPayload;
       }
     | {
         action: 'failed';
         reason: string;
         classification?: PoliAuthFailureClassification;
+        semanticErrorCode?: PolimiSemanticErrorCode;
+        reauthRequired?: boolean;
         diagnostic?: PoliAuthDiagnosticErrorPayload;
       }
   > {
@@ -585,6 +936,9 @@ export class PoliAuthOrchestrator {
       ssoTransitWindowMs = 25_000,
       maxManualOtpAttempts = 3,
       postSubmitDebounceMs = 1_500,
+      pollIntervalMs = 250,
+      nextTotpWindowWaitMs,
+      waitForNextTotpWindow,
       callbacks
     } = params;
 
@@ -608,23 +962,74 @@ export class PoliAuthOrchestrator {
         action: 'failed',
         reason,
         classification: diagnostic.classification,
+        ...(diagnostic.semanticErrorCode
+          ? { semanticErrorCode: diagnostic.semanticErrorCode }
+          : {}),
         diagnostic
       };
     }
 
-    if (
-      polimiStage &&
-      polimiStage.stage === 'unknown' &&
-      polimiStage.diagnosticError &&
-      (polimiStage.diagnosticError.classification === 'PORTAL_OUTAGE_OR_NETWORK_ERROR' ||
-        polimiStage.diagnosticError.classification === 'DOM_SELECTOR_DRIFT')
-    ) {
-      return {
-        action: 'failed',
-        reason: polimiStage.diagnosticError.message,
-        classification: polimiStage.diagnosticError.classification,
-        diagnostic: polimiStage.diagnosticError
-      };
+    if (polimiStage) {
+      const stageSemantic = resolveStageSemanticError(
+        polimiStage,
+        'handleFederatedSamlStep'
+      );
+      if (stageSemantic === 'ACCOUNT_LOCKED' || stageSemantic === 'PASSWORD_EXPIRED') {
+        const reason =
+          polimiStage.errorMessage ||
+          polimiStage.diagnosticError?.message ||
+          (stageSemantic === 'ACCOUNT_LOCKED'
+            ? 'PoliMi account is locked or suspended.'
+            : 'PoliMi password has expired and must be changed.');
+        const diagnostic = classifyPolimiFailure({
+          component: '@polisdk/poliauth/application/login-orchestrator',
+          operation: 'handleFederatedSamlStep',
+          stage: polimiStage.stage,
+          url: polimiStage.url,
+          httpStatus: polimiStage.httpStatus,
+          errorMessage: polimiStage.errorMessage ?? reason,
+          diagnosticSnapshot: polimiStage.diagnosticSnapshot,
+          error: reason
+        });
+        await this.tripCircuitBreaker(userId, stageSemantic, reason);
+        return {
+          action: 'failed',
+          reason,
+          classification: diagnostic.classification,
+          semanticErrorCode: stageSemantic,
+          reauthRequired: true,
+          diagnostic
+        };
+      }
+
+      if (
+        stageSemantic === 'IDP_MAINTENANCE' ||
+        (polimiStage.stage === 'unknown' &&
+          polimiStage.diagnosticError &&
+          (polimiStage.diagnosticError.classification === 'PORTAL_OUTAGE_OR_NETWORK_ERROR' ||
+            polimiStage.diagnosticError.classification === 'DOM_SELECTOR_DRIFT'))
+      ) {
+        const diag =
+          polimiStage.diagnosticError ??
+          classifyPolimiFailure({
+            component: '@polisdk/poliauth/application/login-orchestrator',
+            operation: 'handleFederatedSamlStep',
+            stage: polimiStage.stage,
+            url: polimiStage.url,
+            httpStatus: polimiStage.httpStatus,
+            errorMessage: polimiStage.errorMessage,
+            diagnosticSnapshot: polimiStage.diagnosticSnapshot,
+            error: polimiStage.errorMessage || 'PoliMi Identity Provider maintenance detected.'
+          });
+        return {
+          action: 'failed',
+          reason: diag.message,
+          classification: diag.classification,
+          semanticErrorCode: diag.semanticErrorCode ?? stageSemantic,
+          reauthRequired: false,
+          diagnostic: diag
+        };
+      }
     }
 
     // 1. PoliMi expired session / security violation recovery during SAML SSO
@@ -668,9 +1073,28 @@ export class PoliAuthOrchestrator {
       }
 
       if (state.submittedSamlCredentialsCount > 0 && polimiStage.errorMessage) {
+        const reason = `PoliMi login rejected: ${polimiStage.errorMessage}`;
+        const diagnostic = classifyPolimiFailure({
+          component: '@polisdk/poliauth/application/login-orchestrator',
+          operation: 'submitCredentials',
+          stage: 'credentials',
+          url: polimiStage.url,
+          httpStatus: polimiStage.httpStatus,
+          errorMessage: polimiStage.errorMessage,
+          diagnosticSnapshot: polimiStage.diagnosticSnapshot,
+          error: reason
+        });
+        const semanticErrorCode = diagnostic.semanticErrorCode ?? 'INVALID_CREDENTIALS';
+        const tripped = isStage1TerminalSemanticError(semanticErrorCode)
+          ? await this.tripCircuitBreaker(userId, semanticErrorCode, reason)
+          : false;
         return {
           action: 'login_required',
-          reason: `PoliMi login rejected: ${polimiStage.errorMessage}`
+          reason,
+          classification: diagnostic.classification,
+          semanticErrorCode,
+          reauthRequired: tripped,
+          diagnostic
         };
       }
 
@@ -706,17 +1130,34 @@ export class PoliAuthOrchestrator {
         'submitting_credentials',
         'Submitting PoliMi credentials...'
       );
-      const credRes = await driver.submitCredentials({
+      const credRes = (await driver.submitCredentials({
         personCode,
         password,
         stayConnected: true
-      });
+      })) as { ok: boolean; error?: string; diagnostic?: PoliAuthDiagnosticErrorPayload };
       if (!credRes.ok) {
+        const reason =
+          credRes.error || 'Failed to submit PoliMi credentials during SAML SSO.';
+        const diagnostic =
+          credRes.diagnostic ??
+          classifyPolimiFailure({
+            component: '@polisdk/poliauth/application/login-orchestrator',
+            operation: 'submitCredentials',
+            stage: 'credentials',
+            url: polimiStage.url,
+            error: reason
+          });
+        const semanticErrorCode = diagnostic.semanticErrorCode;
+        const tripped = isStage1TerminalSemanticError(semanticErrorCode)
+          ? await this.tripCircuitBreaker(userId, semanticErrorCode, reason)
+          : false;
         return {
           action: 'login_required',
-          reason:
-            credRes.error ||
-            'Failed to submit PoliMi credentials during SAML SSO.'
+          reason,
+          classification: diagnostic.classification,
+          ...(semanticErrorCode ? { semanticErrorCode } : {}),
+          reauthRequired: tripped,
+          diagnostic
         };
       }
       state.credentialsDebounceUntil = Date.now() + postSubmitDebounceMs;
@@ -732,10 +1173,67 @@ export class PoliAuthOrchestrator {
       );
 
       if (state.submittedSamlManualOtpCount > 0 && polimiStage.errorMessage) {
+        const reason = `PoliMi 2FA OTP rejected: ${polimiStage.errorMessage}`;
+        const diagnostic = classifyPolimiFailure({
+          component: '@polisdk/poliauth/application/login-orchestrator',
+          operation: 'submitOtp',
+          stage: 'otp',
+          url: polimiStage.url,
+          httpStatus: polimiStage.httpStatus,
+          errorMessage: polimiStage.errorMessage,
+          diagnosticSnapshot: polimiStage.diagnosticSnapshot,
+          error: reason
+        });
+        const semanticErrorCode = diagnostic.semanticErrorCode ?? 'OTP_REJECTED';
+        const tripped = await this.tripCircuitBreaker(userId, semanticErrorCode, reason);
         return {
           action: 'login_required',
-          reason: `PoliMi 2FA OTP rejected: ${polimiStage.errorMessage}`
+          reason,
+          classification: diagnostic.classification,
+          semanticErrorCode,
+          reauthRequired: tripped,
+          diagnostic
         };
+      }
+
+      let retrySamlAutoTotp = false;
+      if (state.submittedSamlAutoTotpCount > 0 && polimiStage.errorMessage) {
+        const reason = `PoliMi 2FA OTP rejected: ${polimiStage.errorMessage}`;
+        const diagnostic = classifyPolimiFailure({
+          component: '@polisdk/poliauth/application/login-orchestrator',
+          operation: 'submitOtp',
+          stage: 'otp',
+          url: polimiStage.url,
+          httpStatus: polimiStage.httpStatus,
+          errorMessage: polimiStage.errorMessage,
+          diagnosticSnapshot: polimiStage.diagnosticSnapshot,
+          error: reason
+        });
+        const semanticErrorCode = diagnostic.semanticErrorCode ?? 'OTP_REJECTED';
+        if (
+          state.submittedSamlAutoTotpCount === 1 &&
+          !state.retriedSamlAutoTotpNextWindow &&
+          semanticErrorCode === 'OTP_REJECTED'
+        ) {
+          state.retriedSamlAutoTotpNextWindow = true;
+          retrySamlAutoTotp = true;
+          await waitForNextTotpWindowBoundary({
+            pollIntervalMs,
+            nextTotpWindowWaitMs,
+            waitForNextTotpWindow,
+            logger: this.logger
+          });
+        } else {
+          const tripped = await this.tripCircuitBreaker(userId, semanticErrorCode, reason);
+          return {
+            action: 'login_required',
+            reason,
+            classification: diagnostic.classification,
+            semanticErrorCode,
+            reauthRequired: tripped,
+            diagnostic
+          };
+        }
       }
 
       if (
@@ -748,11 +1246,28 @@ export class PoliAuthOrchestrator {
       }
 
       if (state.submittedSamlManualOtpCount >= effectiveMaxManualOtpAttempts) {
+        const reason =
+          polimiStage.errorMessage ||
+          `PoliMi 2FA manual OTP exceeded maximum retry attempts (${effectiveMaxManualOtpAttempts}).`;
+        const diagnostic = classifyPolimiFailure({
+          component: '@polisdk/poliauth/application/login-orchestrator',
+          operation: 'submitOtp',
+          stage: 'otp',
+          url: polimiStage.url,
+          httpStatus: polimiStage.httpStatus,
+          errorMessage: polimiStage.errorMessage,
+          diagnosticSnapshot: polimiStage.diagnosticSnapshot,
+          error: reason
+        });
+        const semanticErrorCode = diagnostic.semanticErrorCode ?? 'OTP_REJECTED';
+        const tripped = await this.tripCircuitBreaker(userId, semanticErrorCode, reason);
         return {
           action: 'login_required',
-          reason:
-            polimiStage.errorMessage ||
-            `PoliMi 2FA manual OTP exceeded maximum retry attempts (${effectiveMaxManualOtpAttempts}).`
+          reason,
+          classification: diagnostic.classification,
+          semanticErrorCode,
+          reauthRequired: tripped,
+          diagnostic
         };
       }
 
@@ -763,10 +1278,12 @@ export class PoliAuthOrchestrator {
         state.explicitOtpToConsume = '';
         state.submittedSamlManualOtpCount += 1;
       } else {
+        const allowAutoTotp =
+          state.submittedSamlAutoTotpCount === 0 || retrySamlAutoTotp;
         const otpChoice = await this.otpCoordinator.obtainOtpCodeForUser(
           userId,
           credentials.totpSecret,
-          state.submittedSamlAutoTotpCount === 0,
+          allowAutoTotp,
           callbacks
         );
         otpToSubmit = otpChoice.otp;
@@ -778,11 +1295,37 @@ export class PoliAuthOrchestrator {
       }
 
       await callbacks?.onStatusChange?.('submitting_otp', 'Submitting 6-digit 2FA code...');
-      const otpRes = await driver.submitOtp({ otp: otpToSubmit });
+      const otpRes = (await driver.submitOtp({ otp: otpToSubmit })) as {
+        ok: boolean;
+        error?: string;
+        diagnostic?: PoliAuthDiagnosticErrorPayload;
+      };
       if (!otpRes.ok) {
+        const reason = otpRes.error || 'Failed to submit 2FA OTP during SAML SSO.';
+        const diagnostic =
+          otpRes.diagnostic ??
+          classifyPolimiFailure({
+            component: '@polisdk/poliauth/application/login-orchestrator',
+            operation: 'submitOtp',
+            stage: 'otp',
+            url: polimiStage.url,
+            error: reason
+          });
+        const semanticErrorCode = diagnostic.semanticErrorCode;
+        const shouldTripOtpFailure =
+          isStage1TerminalSemanticError(semanticErrorCode) ||
+          (semanticErrorCode === 'OTP_REJECTED' &&
+            (state.submittedSamlManualOtpCount > 0 || state.submittedSamlAutoTotpCount >= 2));
+        const tripped = shouldTripOtpFailure
+          ? await this.tripCircuitBreaker(userId, semanticErrorCode, reason)
+          : false;
         return {
           action: 'login_required',
-          reason: otpRes.error || 'Failed to submit 2FA OTP during SAML SSO.'
+          reason,
+          classification: diagnostic.classification,
+          ...(semanticErrorCode ? { semanticErrorCode } : {}),
+          reauthRequired: tripped,
+          diagnostic
         };
       }
       state.otpDebounceUntil = Date.now() + postSubmitDebounceMs;
@@ -941,11 +1484,25 @@ export class PoliAuthOrchestrator {
       ssoTransitWindowMs = 25_000,
       maxManualOtpAttempts = 3,
       postSubmitDebounceMs = pollIntervalMs > 0 ? Math.max(1_500, pollIntervalMs * 4) : 0,
+      nextTotpWindowWaitMs,
+      waitForNextTotpWindow,
       callbacks,
       onAuthenticated
     } = req;
 
     try {
+      const breakerReason = await this.checkPreBrowserCircuitBreaker(userId);
+      if (breakerReason) {
+        await callbacks?.onStatusChange?.('reauth_required', breakerReason);
+        return {
+          ok: false,
+          status: 'reauth_required',
+          error: breakerReason,
+          classification: 'AUTHENTICATION_REJECTED',
+          reauthRequired: true
+        };
+      }
+
       if (entryUrl) {
         const fedDriver = driver as Partial<FederatedSsoPageDriverPort>;
         if (fedDriver.inspectFederatedSsoPage) {
@@ -994,6 +1551,9 @@ export class PoliAuthOrchestrator {
           ssoTransitWindowMs,
           maxManualOtpAttempts,
           postSubmitDebounceMs,
+          pollIntervalMs,
+          nextTotpWindowWaitMs,
+          waitForNextTotpWindow,
           callbacks
         });
 
@@ -1013,6 +1573,8 @@ export class PoliAuthOrchestrator {
             status: 'failed',
             error: res.reason,
             ...(res.classification ? { classification: res.classification } : {}),
+            ...(res.semanticErrorCode ? { semanticErrorCode: res.semanticErrorCode } : {}),
+            ...(res.reauthRequired !== undefined ? { reauthRequired: res.reauthRequired } : {}),
             ...(res.diagnostic ? { diagnostic: res.diagnostic } : {})
           };
         }
@@ -1023,6 +1585,8 @@ export class PoliAuthOrchestrator {
             status: 'waiting_for_login',
             error: res.reason,
             ...(res.classification ? { classification: res.classification } : {}),
+            ...(res.semanticErrorCode ? { semanticErrorCode: res.semanticErrorCode } : {}),
+            ...(res.reauthRequired !== undefined ? { reauthRequired: res.reauthRequired } : {}),
             ...(res.diagnostic ? { diagnostic: res.diagnostic } : {})
           };
         }
@@ -1042,6 +1606,10 @@ export class PoliAuthOrchestrator {
     } catch (err) {
       const diagnostic = extractDiagnosticFromError(err, 'authenticateFederatedSaml', entryUrl);
       const msg = diagnostic.message || redactSensitiveErrorText(err);
+      const semanticErrorCode = diagnostic.semanticErrorCode;
+      const tripped = isStage1TerminalSemanticError(semanticErrorCode)
+        ? await this.tripCircuitBreaker(userId, semanticErrorCode, msg)
+        : false;
       this.logger?.error(`Federated SAML authentication failed: ${msg}`, diagnostic);
       await callbacks?.onStatusChange?.('failed', msg);
       return {
@@ -1049,6 +1617,8 @@ export class PoliAuthOrchestrator {
         status: 'failed',
         error: msg,
         classification: diagnostic.classification,
+        ...(semanticErrorCode ? { semanticErrorCode } : {}),
+        reauthRequired: tripped,
         diagnostic
       };
     }

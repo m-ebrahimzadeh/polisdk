@@ -6,8 +6,11 @@ import {
   inspectPolimiPageStage,
   recoverPolimiSessionPage,
   submitPolimiCredentials,
-  submitPolimiOtp
+  submitPolimiOtp,
+  classifyPolimiSemanticError
 } from '../adapters/polimi-dom-adapter.js';
+import { classifyPolimiSemanticError as classifyFromDomain } from '../domain/index.js';
+import { classifyPolimiSemanticError as classifyFromRoot } from '../src/index.js';
 import {
   WEBEX_SAML_FLOW_SPEC,
   WebexSamlProviderAdapter
@@ -616,5 +619,153 @@ describe('PoliMi & Federated SAML SSO DOM Adapters', () => {
     );
     expect(missingSubmitRes.ok).toBe(false);
     expect(missingSubmitRes.diagnostic?.classification).toBe('DOM_SELECTOR_DRIFT');
+  });
+
+  it('classifies all 6 PolimiSemanticErrorCode variants across Italian and English IdP banners', () => {
+    expect(classifyFromDomain).toBe(classifyPolimiSemanticError);
+    expect(classifyFromRoot).toBe(classifyPolimiSemanticError);
+
+    // 1. INVALID_CREDENTIALS (Italian & English Stage 1 banners)
+    const domInvalidIt = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Polimi - Autenticazione</title></head><body>
+        <div class="poli-messages"><div class="alert-danger"><span class="jaf-message">Credenziali non valide</span></div></div>
+        <form id="login"><input id="login" name="login" /><input id="password" name="password" /></form>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do' }
+    );
+    const resInvalidIt = inspectPolimiPageStage(
+      domInvalidIt.window.document,
+      domInvalidIt.window.location
+    );
+    expect(resInvalidIt.stage).toBe('credentials');
+    expect(resInvalidIt.semanticErrorCode).toBe('INVALID_CREDENTIALS');
+
+    const domInvalidEn = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Polimi - Autenticazione</title></head><body>
+        <div class="alert-danger">Invalid credentials: wrong username or password</div>
+        <form id="login"><input id="login" name="login" /><input id="password" name="password" /></form>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do' }
+    );
+    const resInvalidEn = inspectPolimiPageStage(
+      domInvalidEn.window.document,
+      domInvalidEn.window.location
+    );
+    expect(resInvalidEn.stage).toBe('credentials');
+    expect(resInvalidEn.semanticErrorCode).toBe('INVALID_CREDENTIALS');
+
+    // 2. PASSWORD_EXPIRED (Italian warning & English danger)
+    const domExpiredIt = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Polimi - Autenticazione</title></head><body>
+        <div class="alert-warning">Password scaduta: cambio password obbligatorio</div>
+        <form id="login"><input id="login" name="login" /><input id="password" name="password" /></form>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do' }
+    );
+    const resExpiredIt = inspectPolimiPageStage(
+      domExpiredIt.window.document,
+      domExpiredIt.window.location
+    );
+    expect(resExpiredIt.stage).toBe('credentials');
+    expect(resExpiredIt.semanticErrorCode).toBe('PASSWORD_EXPIRED');
+
+    expect(
+      classifyPolimiSemanticError({
+        operation: 'submitCredentials',
+        stage: 'credentials',
+        errorMessage: 'Password expired - modify your password before continuing'
+      })
+    ).toBe('PASSWORD_EXPIRED');
+
+    // 3. ACCOUNT_LOCKED (Italian & English, including Stage 2 override)
+    const domLockedIt = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Polimi - Autenticazione 2FA</title></head><body>
+        <div class="poli-messages"><div class="alert-danger"><span class="jaf-message">Account bloccato per troppi tentativi</span></div></div>
+        <form id="form_scelta2fa"><input id="otp" name="otp" /></form>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneDFA.do' }
+    );
+    const resLockedIt = inspectPolimiPageStage(
+      domLockedIt.window.document,
+      domLockedIt.window.location
+    );
+    expect(resLockedIt.stage).toBe('otp');
+    expect(resLockedIt.semanticErrorCode).toBe('ACCOUNT_LOCKED');
+
+    expect(
+      classifyPolimiSemanticError({
+        operation: 'inspectPolimiPageStage',
+        stage: 'unknown',
+        errorMessage: 'Account locked due to too many attempts'
+      })
+    ).toBe('ACCOUNT_LOCKED');
+
+    // 4. OTP_REJECTED (Stage 2 Italian & English)
+    const domOtpRejectedIt = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Polimi - Autenticazione 2FA</title></head><body>
+        <div class="poli-messages"><div class="alert-danger"><span class="jaf-message">Codice OTP non valido</span></div></div>
+        <form id="form_scelta2fa"><input id="otp" name="otp" /></form>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneDFA.do' }
+    );
+    const resOtpRejectedIt = inspectPolimiPageStage(
+      domOtpRejectedIt.window.document,
+      domOtpRejectedIt.window.location
+    );
+    expect(resOtpRejectedIt.stage).toBe('otp');
+    expect(resOtpRejectedIt.semanticErrorCode).toBe('OTP_REJECTED');
+
+    expect(
+      classifyPolimiSemanticError({
+        operation: 'submitOtp',
+        stage: 'otp',
+        errorMessage: 'Invalid verification code provided'
+      })
+    ).toBe('OTP_REJECTED');
+
+    // 5. IDP_MAINTENANCE (HTTP 503 / maintenance banner)
+    const domMaint = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Manutenzione</title></head><body>
+        <div class="maintenance-banner">Servizio momentaneamente non disponibile per manutenzione</div>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do' }
+    );
+    const resMaint = inspectPolimiPageStage(
+      domMaint.window.document,
+      domMaint.window.location,
+      { httpStatus: 503 }
+    );
+    expect(resMaint.semanticErrorCode).toBe('IDP_MAINTENANCE');
+    expect(resMaint.diagnosticError?.classification).toBe('PORTAL_OUTAGE_OR_NETWORK_ERROR');
+
+    // 6. DOM_SELECTOR_DRIFT (populated HTTP 200 DOM on *.polimi.it without matched stage)
+    const domDrift = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Polimi - Nuovo Portale</title></head><body>
+        <main><div id="redesigned-sso-app">Unexpected Login Layout</div></main>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/controller/IdentificazioneUnica.do' }
+    );
+    const resDrift = inspectPolimiPageStage(
+      domDrift.window.document,
+      domDrift.window.location,
+      { httpStatus: 200 }
+    );
+    expect(resDrift.stage).toBe('unknown');
+    expect(resDrift.semanticErrorCode).toBe('DOM_SELECTOR_DRIFT');
+    expect(resDrift.diagnosticError?.classification).toBe('DOM_SELECTOR_DRIFT');
+
+    // Non-regression: Stage 0 session expired warning must not trigger semantic credential error
+    const domExpiredSession = new JSDOM(
+      `<!DOCTYPE html><html><head><title>Polimi</title></head><body>
+        <div class="alert-warning">Sessione di lavoro scaduta</div>
+      </body></html>`,
+      { url: 'https://aunicalogin.polimi.it/aunicalogin/SessioneTerminata.do' }
+    );
+    const resExpiredSession = inspectPolimiPageStage(
+      domExpiredSession.window.document,
+      domExpiredSession.window.location
+    );
+    expect(resExpiredSession.stage).toBe('session_expired');
+    expect(resExpiredSession.semanticErrorCode).toBeUndefined();
   });
 });

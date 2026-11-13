@@ -45,6 +45,10 @@ export interface PoliAuthConfig {
    */
   userRepository?: UserIdentityRepositoryPort;
   /**
+   * Alias for `userRepository` used for orchestrator/wizard circuit-breaker wiring.
+   */
+  identityRepository?: UserIdentityRepositoryPort;
+  /**
    * Optional browser session pool (`SessionContextPoolPort`).
    */
   sessionPool?: SessionContextPoolPort;
@@ -76,14 +80,22 @@ export class PoliAuth {
 
   constructor(config: PoliAuthConfig = {}) {
     this.logger = config.logger ? createRedactingLogger(config.logger) : undefined;
+    const configuredUsers = config.identityRepository ?? config.userRepository;
     this.hasUserFactory = Boolean(config.userStorageFactory);
-    this.hasExplicitUserRepository = Boolean(config.userRepository);
+    this.hasExplicitUserRepository = Boolean(configuredUsers);
     this.totp = new TotpService();
     this.otpChallenge = new OtpChallengeCoordinator({ totpGenerator: this.totp });
-    this.wizard = new CredentialSetupWizard();
-    this.orchestrator = new PoliAuthOrchestrator(this.otpChallenge, this.logger);
+    this.users = configuredUsers ?? new InMemoryUserIdentityRepository();
+    this.wizard = new CredentialSetupWizard({
+      identityRepository: this.users,
+      logger: this.logger
+    });
+    this.orchestrator = new PoliAuthOrchestrator({
+      otpCoordinator: this.otpChallenge,
+      logger: this.logger,
+      identityRepository: this.users
+    });
     this.authorization = new AuthorizationService(config.authorizationOptions);
-    this.users = config.userRepository ?? new InMemoryUserIdentityRepository();
     this.sessionPool = config.sessionPool;
     this.vault = new EncryptedCredentialVault({
       storage: config.storage,
@@ -114,14 +126,27 @@ export class PoliAuth {
   }
 
   /**
-   * Saves encrypted credentials for a user or single-tenant context.
+   * Saves encrypted credentials for a user or single-tenant context, resetting any
+   * `reauth_required` / `failed` circuit-breaker state back to `idle`.
    */
   async saveCredentials(
     creds: Partial<SavedVaultCredentials>,
     identityId?: IdentityId,
     secretOverride?: string
   ): Promise<SavedVaultCredentials> {
-    return this.vault.saveCredentials(creds, identityId, secretOverride);
+    const saved = await this.vault.saveCredentials(creds, identityId, secretOverride);
+    if (identityId !== undefined) {
+      const existing = await this.users.getUser(identityId);
+      if (
+        existing &&
+        (existing.loginStatus === 'reauth_required' ||
+          existing.loginStatus === 'failed' ||
+          existing.loginError !== null)
+      ) {
+        await this.users.updateLoginStatus(identityId, 'idle', null);
+      }
+    }
+    return saved;
   }
 
   /**
