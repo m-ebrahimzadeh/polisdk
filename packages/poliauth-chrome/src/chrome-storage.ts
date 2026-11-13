@@ -3,7 +3,7 @@
  * Chrome Extension (`chrome.storage.local`) implementation of `VaultStoragePort`.
  */
 
-import type { VaultStoragePort } from "@polisdk/poliauth";
+import type { VaultSecretMaterialPort, VaultStoragePort } from "@polisdk/poliauth";
 
 export interface ChromeStorageAreaLike {
   get(keys: string | string[]): Promise<Record<string, unknown>>;
@@ -27,7 +27,7 @@ function resolveDefaultChromeLocalStorage(): ChromeStorageAreaLike {
 /**
  * `VaultStoragePort` backed by `chrome.storage.local` (or an injected compatible storage area).
  */
-export class ChromeLocalVaultStorage implements VaultStoragePort {
+export class ChromeLocalVaultStorage implements VaultStoragePort, VaultSecretMaterialPort {
   private readonly storageArea: ChromeStorageAreaLike;
   private readonly secretMaterial?: string;
 

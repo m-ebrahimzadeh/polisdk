@@ -3,7 +3,7 @@
  * Credential Validation, Normalization, and Privacy Masking Utilities.
  */
 
-import type { LoginCredentials, SavedVaultCredentials } from './entities';
+import type { LoginCredentials, SavedVaultCredentials } from './entities.js';
 
 /**
  * Masks a PoliMi Person Code (Codice Persona) for safe display in UI and logs.

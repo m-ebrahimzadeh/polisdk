@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   cleanTotpSecret,
   isValidTotpSecret,
   decodeBase32,
   generateTotp,
+  generateStableTotp,
   getTotpRemainingSeconds,
   TotpService
 } from '../domain/totp.js';
@@ -66,5 +67,48 @@ describe('TOTP Domain Service & Utilities', () => {
     expect(res.code).toMatch(/^\d{6}$/);
     expect(res.remainingSeconds).toBe(25);
     expect(res.waitedMs).toBe(0);
+  });
+
+  it('matches official RFC 6238 SHA-1 test vectors (8 digits, 30s time step)', async () => {
+    // ASCII "12345678901234567890" encoded as RFC 4648 Base32
+    const rfc6238SecretBase32 = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+    const vectors: Array<[number, string]> = [
+      [59, '94287082'],
+      [1_111_111_109, '07081804'],
+      [1_111_111_111, '14050471'],
+      [1_234_567_890, '89005924'],
+      [2_000_000_000, '69279037'],
+      [20_000_000_000, '65353130']
+    ];
+
+    for (const [epochSeconds, expectedCode] of vectors) {
+      const code = await generateTotp(rfc6238SecretBase32, {
+        timestampMs: epochSeconds * 1000,
+        timeStepSeconds: 30,
+        digits: 8
+      });
+      expect(code).toBe(expectedCode);
+    }
+  });
+
+  it('waits for window rollover in generateStableTotp when <= 2s remain', async () => {
+    vi.useFakeTimers();
+    try {
+      const secret = 'JBSWY3DPEHPK3PXP';
+      // 29s into a 30s window -> 1s remaining (<= default minRemainingSeconds 2s)
+      vi.setSystemTime(29_000);
+
+      const expectedNextWindowCode = await generateTotp(secret, { timestampMs: 30_500 });
+      const promise = generateStableTotp(secret, { minRemainingSeconds: 2 });
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      const res = await promise;
+
+      expect(res.waitedMs).toBe(1_500);
+      expect(res.code).toBe(expectedNextWindowCode);
+      expect(res.remainingSeconds).toBe(30);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

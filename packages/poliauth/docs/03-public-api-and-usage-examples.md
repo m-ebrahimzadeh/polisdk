@@ -5,8 +5,8 @@
 | Package | Purpose | Runtime Dependencies |
 |---|---|---|
 | `@polisdk/poliauth` | Core authentication domain, application use cases, hexagonal ports, pure DOM adapters, and Web Crypto AES-256-GCM vault | Zero (Standard ES2022 + Web Crypto + DOM) |
-| `@polisdk/poliauth-playwright` | Playwright `PlaywrightAuthPageDriver`, build-time pre-bundled DOM injector, and `PlaywrightSessionContextPool` | `@polisdk/poliauth`, `playwright` (peer) |
-| `@polisdk/poliauth-chrome` | Chrome Extension MV3 `ChromeLocalVaultStorage`, `ChromeExtensionTabDriver`, and `createPoliAuthContentScriptHandler` | `@polisdk/poliauth` |
+| `@polisdk/poliauth-playwright` | Playwright `PlaywrightAuthPageDriver`, build-time pre-bundled DOM injector, and `PlaywrightBrowserSessionPool` | `@polisdk/poliauth`, `playwright` (peer) |
+| `@polisdk/poliauth-chrome` | Chrome Extension MV3 `ChromeLocalVaultStorage`, `ChromeExtensionTabDriver`, `createPoliAuthContentScriptHandler`, and `createPoliAuthChromeRuntimeMessageListener` | `@polisdk/poliauth` |
 | `@polisdk/storage-sqlite` | SQLite multi-user `PoliAuthSqliteDatabase`, `SqliteVaultStorageBackend`, `SqliteSessionStateStore`, and `resolveMasterEncryptionKey` | `@polisdk/poliauth`, `better-sqlite3` (peer) |
 | `@polisdk/telegram-auth` | Telegram Bot `createTelegramAuthMiddleware`, `deleteSensitiveTelegramMessage`, `TelegramCredentialWizard`, and `TELEGRAM_BOT_TOKEN_REDACTION_RULE` | `@polisdk/poliauth` |
 
@@ -17,8 +17,8 @@
 | Import Path | Contents |
 |---|---|
 | `@polisdk/poliauth` | Unified `PoliAuth` facade + re-exports of all core layers |
-| `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`, `PolimiStageInspectionResult`, `FederatedSsoInspectionResult`), `TotpService`, `cleanTotpSecret`, `isValidTotpSecret`, `decodeTotpBase32`, `generateTotp`, `generateStableTotp`, `getTotpRemainingSeconds`, `TotpOptions`, `StableTotpOptions`, `StableTotpResult`, `TotpGeneratorPort`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation utilities (`normalizeCredentials`, `maskSecret`, `maskPersonCode`) |
-| `@polisdk/poliauth/application` | `PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService` |
+| `@polisdk/poliauth/domain` | Pure domain entities (`IdentityId`, `LoginCredentials`, `SavedVaultCredentials`, `UserIdentity`, `PolimiStageInspectionResult`, `FederatedSsoInspectionResult`), `TotpService`, `cleanTotpSecret`, `isValidTotpSecret`, `decodeBase32`, `generateTotp`, `generateStableTotp`, `getTotpRemainingSeconds`, `TotpOptions`, `StableTotpOptions`, `StableTotpResult`, `TotpGeneratorPort`, `POLIMI_LOGIN_FLOW_SPEC`, credential masking/validation/merge utilities (`isValidPersonCode`, `isValidPolimiEmail`, `isValidOtpCode`, `mergeVaultCredentials`, `maskSecret`, `maskPersonCode`, `maskPolimiEmail`), and redaction primitives (`RedactionRule`, `redactSecrets`, `redactSensitiveErrorText`) |
+| `@polisdk/poliauth/application` | `PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService`, `createRedactingLogger` |
 | `@polisdk/poliauth/interfaces` | Segregated role ports: `AuthPageDriverPort`, `PageNavigationPort`, `PolimiIdpPagePort`, `FederatedSsoPageDriverPort`, `FederatedAuthPageDriverPort`, `FederatedSsoProviderAdapterPort`, `FederatedSsoProviderResolverPort`, `FederatedSsoProviderSpec`, `FederatedIdentifierPromptSpec`, `FederatedLoginTriggerSpec`, `VaultStoragePort`, `VaultSecretMaterialPort`, `UserVaultStorageFactoryPort`, `SessionStateStorePort`, `UserIdentityRepositoryPort`, `UserIdentityProvisionerPort`, `UserIdentityReaderPort`, `UserIdentityWriterPort`, `SessionContextPoolPort`, `SessionContextLeasePort`, `SessionContextPersistencePort`, `SessionContextDisposalPort`, `SessionPoolStatsPort`, `OtpChallengeProviderPort`, `OtpCodeProviderPort`, `ManualOtpChallengePort`, `AuthorizationServicePort`, `AccessEvaluatorPort`, `SubjectRoleQueryPort`, `ResourceAuthorizerPort`, `ResourceAuthorizationPolicyPort`, `AuthLoggerPort`, `MaybePromise` |
 | `@polisdk/poliauth/storage` | `EncryptedCredentialVault`, `saveEncryptedCredentials`, `loadEncryptedCredentials`, `clearEncryptedCredentials`, `saveEncryptedSessionState`, `loadEncryptedSessionState`, `clearEncryptedSessionState`, `InMemoryVaultStorage`, `InMemoryUserVaultStorageFactory`, `InMemorySessionStateStore`, `InMemoryUserIdentityRepository` |
 | `@polisdk/poliauth/adapters` | `DomAuthPageDriver`, `DomFederatedAuthPageDriver`, `polimi-dom-adapter`, `webex-sso-dom-adapter` (`WebexSamlProviderAdapter`, `WEBEX_SAML_FLOW_SPEC`, `createWebexSamlFlowSpec`), `federated-sso-dom-adapter` (`SelectorFederatedSsoProviderAdapter`, `inspectFederatedSsoPageBySpec`, `isFederatedLoginTriggerPage`, `submitFederatedIdentifierBySpec`, `triggerFederatedLoginBySpec`), `federated-sso-provider-registry` (`FederatedSsoProviderRegistry`, `createDefaultFederatedSsoProviderRegistry`) |
@@ -38,7 +38,7 @@ import {
 } from '@polisdk/storage-sqlite';
 import {
   PlaywrightAuthPageDriver,
-  PlaywrightSessionContextPool
+  PlaywrightBrowserSessionPool
 } from '@polisdk/poliauth-playwright';
 
 const masterKey = resolveMasterEncryptionKey({
@@ -46,14 +46,14 @@ const masterKey = resolveMasterEncryptionKey({
 });
 const db = new PoliAuthSqliteDatabase('./data/poliauth.sqlite');
 
-const auth = new PoliAuth({
-  userVaultFactory: new SqliteUserVaultStorageFactory(db, masterKey),
-  sessionStateStore: new SqliteSessionStateStore(db, masterKey),
-  userRepository: db
+const pool = new PlaywrightBrowserSessionPool({
+  sessionStateStore: new SqliteSessionStateStore(db, masterKey)
 });
 
-const pool = new PlaywrightSessionContextPool({
-  sessionStateStore: new SqliteSessionStateStore(db, masterKey)
+const auth = new PoliAuth({
+  userStorageFactory: new SqliteUserVaultStorageFactory(db, masterKey),
+  userRepository: db,
+  sessionPool: pool
 });
 
 // Authenticate user 1001 in an isolated Playwright context
@@ -97,6 +97,7 @@ const creds = await auth.loadCredentials();
 if (creds) {
   const driver = new ChromeExtensionTabDriver(activeTabId);
   await auth.authenticate({
+    userId: 'default-user',
     driver,
     credentials: creds
   });

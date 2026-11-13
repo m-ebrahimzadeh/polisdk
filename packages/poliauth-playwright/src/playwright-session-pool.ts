@@ -6,6 +6,7 @@ import type {
   SessionStateStorePort,
   AuthLoggerPort
 } from '@polisdk/poliauth/interfaces';
+import { createRedactingLogger, redactSensitiveErrorText } from '@polisdk/poliauth/middleware';
 import { getInjectedAuthAdapterBundleCode } from './injected-auth-bundle.js';
 import type { PlaywrightPageLike } from './playwright-page-driver.js';
 
@@ -34,6 +35,7 @@ export interface PlaywrightBrowserLike<
 > {
   newContext(options?: Record<string, unknown>): Promise<TContext>;
   close(): Promise<void>;
+  isConnected?(): boolean;
 }
 
 export interface PlaywrightSessionPoolOptions<
@@ -89,6 +91,8 @@ export class PlaywrightBrowserSessionPool<
 > implements SessionContextPoolPort<TContext, TPage>
 {
   private browser: PlaywrightBrowserLike<TContext, TPage> | null = null;
+  private browserLaunchPromise: Promise<PlaywrightBrowserLike<TContext, TPage>> | null = null;
+  private poolMutexTail: Promise<void> = Promise.resolve();
   private readonly entries = new Map<string, ManagedSessionContext<TContext, TPage>>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -103,13 +107,13 @@ export class PlaywrightBrowserSessionPool<
 
   constructor(options: PlaywrightSessionPoolOptions<TContext, TPage> = {}) {
     this.sessionStateStore = options.sessionStateStore;
-    this.maxBrowserContexts = options.maxBrowserContexts ?? 4;
+    this.maxBrowserContexts = Math.max(1, options.maxBrowserContexts ?? 4);
     this.browserContextIdleTtlMs = options.browserContextIdleTtlMs ?? 15 * 60_000;
     this.headless = options.headless ?? true;
     this.browserLauncher = options.browserLauncher;
     this.initScriptCode = options.initScriptCode;
     this.contextOptions = options.contextOptions;
-    this.logger = options.logger;
+    this.logger = options.logger ? createRedactingLogger(options.logger) : undefined;
 
     this.cleanupTimer = setInterval(() => {
       void this.evictExpiredContexts();
@@ -117,82 +121,149 @@ export class PlaywrightBrowserSessionPool<
     unrefIntervalIfSupported(this.cleanupTimer);
   }
 
+  private withPoolMutex<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.poolMutexTail.then(fn, fn);
+    this.poolMutexTail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private isBrowserConnected(
+    browser: PlaywrightBrowserLike<TContext, TPage> | null
+  ): browser is PlaywrightBrowserLike<TContext, TPage> {
+    if (!browser) return false;
+    if (typeof browser.isConnected === 'function') {
+      return browser.isConnected();
+    }
+    return true;
+  }
+
   private async ensureBrowser(): Promise<PlaywrightBrowserLike<TContext, TPage>> {
     if (this.browser) {
-      return this.browser;
+      if (this.isBrowserConnected(this.browser)) {
+        return this.browser;
+      }
+      this.logger?.warn(
+        'Playwright browser is disconnected; clearing stale pool entries and relaunching.'
+      );
+      this.entries.clear();
+      this.browser = null;
     }
 
-    if (this.browserLauncher) {
-      this.browser = await this.browserLauncher();
-      return this.browser;
+    if (this.browserLaunchPromise) {
+      return this.browserLaunchPromise;
     }
 
-    const pw = await import('playwright');
-    this.browser = (await pw.chromium.launch({
-      headless: this.headless,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-dev-shm-usage'
-      ]
-    })) as unknown as PlaywrightBrowserLike<TContext, TPage>;
-    return this.browser;
+    const launchPromise = (async () => {
+      if (this.browserLauncher) {
+        const launched = await this.browserLauncher();
+        this.browser = launched;
+        return launched;
+      }
+
+      const pw = await import('playwright');
+      const launched = (await pw.chromium.launch({
+        headless: this.headless,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--no-sandbox',
+          '--disable-dev-shm-usage'
+        ]
+      })) as unknown as PlaywrightBrowserLike<TContext, TPage>;
+      this.browser = launched;
+      return launched;
+    })();
+
+    this.browserLaunchPromise = launchPromise;
+    try {
+      return await launchPromise;
+    } finally {
+      if (this.browserLaunchPromise === launchPromise) {
+        this.browserLaunchPromise = null;
+      }
+    }
+  }
+
+  private isPageOpen(page: TPage | null | undefined): page is TPage {
+    if (!page) return false;
+    const maybePage = page as unknown as { isClosed?: () => boolean };
+    if (typeof maybePage.isClosed === 'function') {
+      return !maybePage.isClosed();
+    }
+    return true;
+  }
+
+  private async persistEntryState(
+    entry: ManagedSessionContext<TContext, TPage>
+  ): Promise<void> {
+    if (!this.sessionStateStore) return;
+    const key = normalizeIdentityId(entry.userId);
+    try {
+      const state = await entry.context.storageState();
+      await this.sessionStateStore.saveSessionState(entry.userId, state);
+    } catch (err) {
+      this.logger?.warn(
+        `Failed to persist storageState for user ${key}: ${redactSensitiveErrorText(err)}`
+      );
+    }
   }
 
   async acquireUserContext(
     userId: IdentityId
   ): Promise<ManagedSessionContext<TContext, TPage>> {
-    const key = normalizeIdentityId(userId);
-    const existing = this.entries.get(key);
-    if (existing) {
-      const pages = existing.context.pages();
-      if (pages.length === 0 || !existing.primaryPage) {
-        existing.primaryPage = await existing.context.newPage();
+    return this.withPoolMutex(async () => {
+      const key = normalizeIdentityId(userId);
+      const browser = await this.ensureBrowser();
+
+      const existing = this.entries.get(key);
+      if (existing) {
+        await this.getOrCreatePrimaryPage(existing);
+        existing.activeLocks += 1;
+        existing.lastActiveAt = Date.now();
+        return existing;
       }
-      existing.activeLocks += 1;
-      existing.lastActiveAt = Date.now();
-      return existing;
-    }
 
-    await this.evictIfAtCapacity();
-    const browser = await this.ensureBrowser();
+      await this.evictIfAtCapacityLocked();
 
-    const savedState = this.sessionStateStore
-      ? await this.sessionStateStore.loadSessionState(userId)
-      : null;
+      const savedState = this.sessionStateStore
+        ? await this.sessionStateStore.loadSessionState(userId)
+        : null;
 
-    const baseOptions: Record<string, unknown> = {
-      acceptDownloads: true,
-      viewport: { width: 1366, height: 900 },
-      locale: 'it-IT',
-      ...this.contextOptions
-    };
+      const baseOptions: Record<string, unknown> = {
+        acceptDownloads: true,
+        viewport: { width: 1366, height: 900 },
+        locale: 'it-IT',
+        ...this.contextOptions
+      };
 
-    if (savedState && typeof savedState === 'object') {
-      baseOptions.storageState = savedState;
-    }
+      if (savedState && typeof savedState === 'object') {
+        baseOptions.storageState = savedState;
+      }
 
-    let context: TContext;
-    try {
-      context = await browser.newContext(baseOptions);
-    } catch {
-      delete baseOptions.storageState;
-      context = await browser.newContext(baseOptions);
-    }
+      let context: TContext;
+      try {
+        context = await browser.newContext(baseOptions);
+      } catch {
+        delete baseOptions.storageState;
+        context = await browser.newContext(baseOptions);
+      }
 
-    const scriptToInject = this.initScriptCode ?? getInjectedAuthAdapterBundleCode();
-    await context.addInitScript(scriptToInject);
+      const scriptToInject = this.initScriptCode ?? getInjectedAuthAdapterBundleCode();
+      await context.addInitScript(scriptToInject);
 
-    const primaryPage = await context.newPage();
-    const entry: ManagedSessionContext<TContext, TPage> = {
-      userId,
-      context,
-      primaryPage,
-      lastActiveAt: Date.now(),
-      activeLocks: 1
-    };
-    this.entries.set(key, entry);
-    return entry;
+      const primaryPage = await context.newPage();
+      const entry: ManagedSessionContext<TContext, TPage> = {
+        userId,
+        context,
+        primaryPage,
+        lastActiveAt: Date.now(),
+        activeLocks: 1
+      };
+      this.entries.set(key, entry);
+      return entry;
+    });
   }
 
   releaseUserContext(userId: IdentityId): void {
@@ -207,9 +278,20 @@ export class PlaywrightBrowserSessionPool<
     managed: ManagedSessionContext<TContext, TPage>
   ): Promise<TPage> {
     const pages = managed.context.pages();
-    if (pages.length > 0 && managed.primaryPage) {
+    if (
+      managed.primaryPage &&
+      this.isPageOpen(managed.primaryPage) &&
+      pages.includes(managed.primaryPage)
+    ) {
       return managed.primaryPage;
     }
+
+    const openFallback = pages.find((p) => this.isPageOpen(p));
+    if (openFallback) {
+      managed.primaryPage = openFallback;
+      return openFallback;
+    }
+
     const page = await managed.context.newPage();
     managed.primaryPage = page;
     return page;
@@ -220,31 +302,27 @@ export class PlaywrightBrowserSessionPool<
     const key = normalizeIdentityId(userId);
     const entry = this.entries.get(key);
     if (!entry) return;
-
-    try {
-      const state = await entry.context.storageState();
-      await this.sessionStateStore.saveSessionState(entry.userId, state);
-    } catch (err) {
-      this.logger?.warn(`Failed to persist storageState for user ${key}`, err);
-    }
+    await this.persistEntryState(entry);
   }
 
   async destroyUserContext(
     userId: IdentityId,
     options?: { skipSaveState?: boolean; clearPersistedState?: boolean }
   ): Promise<void> {
-    const key = normalizeIdentityId(userId);
-    const entry = this.entries.get(key);
-    if (entry) {
-      if (!options?.skipSaveState && !options?.clearPersistedState) {
-        await this.saveUserContextState(userId);
+    return this.withPoolMutex(async () => {
+      const key = normalizeIdentityId(userId);
+      const entry = this.entries.get(key);
+      if (entry) {
+        if (!options?.skipSaveState && !options?.clearPersistedState) {
+          await this.persistEntryState(entry);
+        }
+        this.entries.delete(key);
+        await entry.context.close().catch(() => undefined);
       }
-      this.entries.delete(key);
-      await entry.context.close().catch(() => undefined);
-    }
-    if (options?.clearPersistedState && this.sessionStateStore) {
-      await this.sessionStateStore.clearSessionState(userId).catch(() => undefined);
-    }
+      if (options?.clearPersistedState && this.sessionStateStore) {
+        await this.sessionStateStore.clearSessionState(userId).catch(() => undefined);
+      }
+    });
   }
 
   /**
@@ -268,7 +346,7 @@ export class PlaywrightBrowserSessionPool<
     }
   }
 
-  private async evictIfAtCapacity(): Promise<void> {
+  private async evictIfAtCapacityLocked(): Promise<void> {
     if (this.entries.size < this.maxBrowserContexts) {
       return;
     }
@@ -279,23 +357,31 @@ export class PlaywrightBrowserSessionPool<
 
     while (this.entries.size >= this.maxBrowserContexts && idleEntries.length > 0) {
       const [victimKey, victimEntry] = idleEntries.shift()!;
-      await this.saveUserContextState(victimEntry.userId);
       this.entries.delete(victimKey);
+      await this.persistEntryState(victimEntry);
       await victimEntry.context.close().catch(() => undefined);
+    }
+
+    if (this.entries.size >= this.maxBrowserContexts) {
+      throw new Error(
+        `PlaywrightBrowserSessionPool capacity reached (${this.entries.size}/${this.maxBrowserContexts}): all active contexts are locked.`
+      );
     }
   }
 
   async evictExpiredContexts(now: number = Date.now()): Promise<void> {
-    for (const [key, entry] of Array.from(this.entries.entries())) {
-      if (
-        entry.activeLocks === 0 &&
-        now - entry.lastActiveAt > this.browserContextIdleTtlMs
-      ) {
-        await this.saveUserContextState(entry.userId);
-        this.entries.delete(key);
-        await entry.context.close().catch(() => undefined);
+    return this.withPoolMutex(async () => {
+      for (const [key, entry] of Array.from(this.entries.entries())) {
+        if (
+          entry.activeLocks === 0 &&
+          now - entry.lastActiveAt > this.browserContextIdleTtlMs
+        ) {
+          this.entries.delete(key);
+          await this.persistEntryState(entry);
+          await entry.context.close().catch(() => undefined);
+        }
       }
-    }
+    });
   }
 
   getStats(): SessionPoolStats {
@@ -308,7 +394,7 @@ export class PlaywrightBrowserSessionPool<
     return {
       activeContexts: this.entries.size,
       busyContexts,
-      browserConnected: this.browser !== null
+      browserConnected: this.isBrowserConnected(this.browser)
     };
   }
 
@@ -318,15 +404,17 @@ export class PlaywrightBrowserSessionPool<
       this.cleanupTimer = null;
     }
 
-    for (const [key, entry] of Array.from(this.entries.entries())) {
-      await this.saveUserContextState(entry.userId);
-      this.entries.delete(key);
-      await entry.context.close().catch(() => undefined);
-    }
+    return this.withPoolMutex(async () => {
+      for (const [key, entry] of Array.from(this.entries.entries())) {
+        this.entries.delete(key);
+        await this.persistEntryState(entry);
+        await entry.context.close().catch(() => undefined);
+      }
 
-    if (this.browser) {
-      await this.browser.close().catch(() => undefined);
-      this.browser = null;
-    }
+      if (this.browser) {
+        await this.browser.close().catch(() => undefined);
+        this.browser = null;
+      }
+    });
   }
 }

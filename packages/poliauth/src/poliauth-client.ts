@@ -25,7 +25,7 @@ import {
   type VaultCryptoOptions
 } from '../storage/vault.js';
 import { InMemoryUserIdentityRepository } from '../storage/memory-storage.js';
-import { createRedactingLogger } from '../middleware/redaction.js';
+import { createRedactingLogger } from '../application/redacting-logger.js';
 
 export interface PoliAuthConfig {
   /**
@@ -71,9 +71,13 @@ export class PoliAuth {
   public readonly users: UserIdentityRepositoryPort;
   public readonly sessionPool?: SessionContextPoolPort;
   public readonly logger?: AuthLoggerPort;
+  private readonly hasUserFactory: boolean;
+  private readonly hasExplicitUserRepository: boolean;
 
   constructor(config: PoliAuthConfig = {}) {
     this.logger = config.logger ? createRedactingLogger(config.logger) : undefined;
+    this.hasUserFactory = Boolean(config.userStorageFactory);
+    this.hasExplicitUserRepository = Boolean(config.userRepository);
     this.totp = new TotpService();
     this.otpChallenge = new OtpChallengeCoordinator({ totpGenerator: this.totp });
     this.wizard = new CredentialSetupWizard();
@@ -143,14 +147,20 @@ export class PoliAuth {
     if (identityId !== undefined) {
       this.wizard.cancelSession(identityId);
       this.otpChallenge.cancelPendingOtpWaiter(identityId, 'User logged out.');
+      this.users.updateLoginStatus(identityId, 'idle', null);
     }
 
-    if (options.clearCredentials !== false) {
+    const skipSharedSingleStorageWipe =
+      identityId !== undefined && !this.hasUserFactory && this.hasExplicitUserRepository;
+
+    if (options.clearCredentials !== false && !skipSharedSingleStorageWipe) {
       await this.vault.clearCredentials(identityId);
     }
 
     if (options.clearSessionState !== false) {
-      await this.vault.clearSessionState(identityId);
+      if (!skipSharedSingleStorageWipe) {
+        await this.vault.clearSessionState(identityId);
+      }
       if (identityId !== undefined && this.sessionPool) {
         await this.sessionPool.destroyUserContext(identityId, {
           skipSaveState: true

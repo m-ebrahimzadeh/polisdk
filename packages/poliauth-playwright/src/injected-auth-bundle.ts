@@ -10,11 +10,19 @@ export interface EvaluatablePageLike {
     pageFunction: ((arg: Arg) => R | Promise<R>) | string,
     arg?: Arg
   ): Promise<R>;
+  addScriptTag?(options: { content?: string; url?: string; path?: string }): Promise<unknown>;
 }
 
 function isTransientInjectionError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|target closed|navigation/i.test(
+  if (
+    /target closed|page has been closed|browser has been closed|context has been closed|has been closed/i.test(
+      msg
+    )
+  ) {
+    return false;
+  }
+  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|navigating to|navigation in progress|interrupted by.*navigation/i.test(
     msg
   );
 }
@@ -43,7 +51,18 @@ export async function ensureAuthAdaptersInjected(
     });
 
     if (!hasAdapters) {
-      await page.evaluate(getInjectedAuthAdapterBundleCode());
+      const bundleCode = getInjectedAuthAdapterBundleCode();
+      try {
+        await page.evaluate(bundleCode);
+      } catch (evalErr) {
+        if (isTransientInjectionError(evalErr) || typeof page.addScriptTag !== 'function') {
+          throw evalErr;
+        }
+        safeLogger?.warn(
+          `page.evaluate adapter injection failed (${redactSensitiveErrorText(evalErr)}); falling back to page.addScriptTag.`
+        );
+        await page.addScriptTag({ content: bundleCode });
+      }
     }
     return true;
   } catch (err) {

@@ -31,6 +31,7 @@ export interface VaultStoragePort {
  */
 export interface VaultSecretMaterialPort {
   getSecretMaterial(): string | undefined;
+  readonly requiresSecretMaterial?: boolean;
 }
 
 /**

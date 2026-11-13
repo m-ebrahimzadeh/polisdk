@@ -89,7 +89,10 @@ export class TelegramCredentialWizard {
   }
 
   skipTotpStep(userId: IdentityId): WizardTransitionResult | null {
-    this.promptIds.delete(normalizeIdentityId(userId));
-    return this.wizard.skipTotpStep(userId);
+    const result = this.wizard.skipTotpStep(userId);
+    if (!result || result.status === "completed") {
+      this.promptIds.delete(normalizeIdentityId(userId));
+    }
+    return result;
   }
 }

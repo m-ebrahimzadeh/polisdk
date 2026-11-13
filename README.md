@@ -7,8 +7,8 @@
 | Package | Description | Path |
 |---|---|---|
 | [`@polisdk/poliauth`](./packages/poliauth) | Standalone, platform-agnostic authentication core: PoliMi SSO & 2FA TOTP/OTP orchestration, Web Crypto AES-256-GCM credential & session vault, federated SAML 2.0 SSO, DOM adapters, and RBAC middleware. | `packages/poliauth` |
-| [`@polisdk/poliauth-playwright`](./packages/poliauth-playwright) | Playwright `AuthPageDriverPort`, pre-bundled DOM injection script, and reference-counted `PlaywrightSessionContextPool` with LRU eviction and encrypted `storageState` persistence. | `packages/poliauth-playwright` |
-| [`@polisdk/poliauth-chrome`](./packages/poliauth-chrome) | Chrome Extension MV3 adapters (`ChromeLocalVaultStorage`, `ChromeExtensionTabDriver`, and `createPoliAuthContentScriptHandler`). | `packages/poliauth-chrome` |
+| [`@polisdk/poliauth-playwright`](./packages/poliauth-playwright) | Playwright `AuthPageDriverPort`, pre-bundled DOM injection script, and reference-counted `PlaywrightBrowserSessionPool` with LRU eviction and encrypted `storageState` persistence. | `packages/poliauth-playwright` |
+| [`@polisdk/poliauth-chrome`](./packages/poliauth-chrome) | Chrome Extension MV3 adapters (`ChromeLocalVaultStorage`, `ChromeExtensionTabDriver`, `createPoliAuthContentScriptHandler`, and `createPoliAuthChromeRuntimeMessageListener`). | `packages/poliauth-chrome` |
 | [`@polisdk/storage-sqlite`](./packages/storage-sqlite) | SQLite multi-user identity repository (`PoliAuthSqliteDatabase`), encrypted per-user credential & session vault (`SqliteVaultStorageBackend`, `SqliteSessionStateStore`), and `resolveMasterEncryptionKey`. | `packages/storage-sqlite` |
 | [`@polisdk/telegram-auth`](./packages/telegram-auth) | Telegram Bot authentication middleware (`createTelegramAuthMiddleware`), sensitive message deletion (`deleteSensitiveTelegramMessage`), and interactive `TelegramCredentialWizard`. | `packages/telegram-auth` |
 

@@ -31,7 +31,15 @@ export interface PlaywrightPageLike extends EvaluatablePageLike {
     state?: 'load' | 'domcontentloaded' | 'networkidle',
     options?: { timeout?: number }
   ): Promise<void>;
+  waitForURL?(
+    url: string | RegExp | ((url: URL) => boolean),
+    options?: {
+      timeout?: number;
+      waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit';
+    }
+  ): Promise<void>;
   waitForTimeout?(timeout: number): Promise<void>;
+  isClosed?(): boolean;
 }
 
 export interface PlaywrightAuthPageDriverOptions {
@@ -58,7 +66,14 @@ export interface PlaywrightAuthPageDriverOptions {
 
 function isTransientNavigationError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|target closed|navigation/i.test(
+  if (
+    /target closed|page has been closed|browser has been closed|context has been closed|has been closed/i.test(
+      msg
+    )
+  ) {
+    return false;
+  }
+  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|navigating to|navigation in progress|interrupted by.*navigation/i.test(
     msg
   );
 }
@@ -187,6 +202,7 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
   }
 
   async recoverSessionPage(): Promise<SessionRecoveryResult> {
+    const beforeUrl = this.page.url();
     try {
       const recovery = await this.evaluateWithRetry('recoverSessionPage', () =>
         this.page.evaluate(() => {
@@ -194,10 +210,36 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
         })
       );
       if (!recovery.ok) {
-        await this.goto(recovery.navigatedTo);
-      } else {
-        await this.waitForNavigation(1800);
+        const targetUrl =
+          recovery.navigatedTo || POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
+        await this.goto(targetUrl);
+        return { ok: false, navigatedTo: targetUrl };
       }
+
+      if (typeof this.page.waitForURL === 'function') {
+        await this.page
+          .waitForURL(
+            (nextUrl) =>
+              nextUrl.href !== beforeUrl ||
+              !nextUrl.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker),
+            { timeout: 1_800, waitUntil: 'domcontentloaded' }
+          )
+          .catch(() => undefined);
+      } else if (this.page.waitForTimeout) {
+        await this.page.waitForTimeout(100).catch(() => undefined);
+      }
+      await this.waitForNavigation(1_800);
+
+      if (
+        beforeUrl.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker) &&
+        this.page.url().includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker)
+      ) {
+        const targetUrl =
+          recovery.navigatedTo || POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
+        await this.goto(targetUrl);
+        return { ok: false, navigatedTo: targetUrl };
+      }
+
       return recovery;
     } catch (err) {
       if (!isTransientNavigationError(err)) {

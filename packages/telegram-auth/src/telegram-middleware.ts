@@ -39,10 +39,10 @@ export interface TelegramAuthMiddlewareOptions
   extends AuthorizationServiceOptions {
   /** Optional user identity repository to automatically upsert authorized users. */
   userRepository?: UserIdentityRepositoryPort;
-  /** Optional callback invoked when a user record is upserted on authorized request. */
+  /** Optional callback invoked when an authorized request completes authentication checks. */
   onUserAuthenticated?: (
     ctx: TelegramContextLike,
-    user: UserIdentity,
+    user?: UserIdentity,
   ) => void | Promise<void>;
   /** Custom unauthorized reply message. */
   unauthorizedReplyText?: (userId: number) => string;
@@ -78,6 +78,7 @@ export function createTelegramAuthMiddleware<
   ): Promise<void> => {
     const from = ctx.from;
     if (!from) {
+      await next();
       return;
     }
 
@@ -96,25 +97,29 @@ export function createTelegramAuthMiddleware<
         return;
       }
 
-      const text = options.unauthorizedReplyText
-        ? options.unauthorizedReplyText(from.id)
-        : `⛔ Non sei autorizzato a usare questo bot.\nIl tuo ID utente è: \`${from.id}\``;
+      if (options.unauthorizedReplyText) {
+        await ctx.reply(options.unauthorizedReplyText(from.id));
+        return;
+      }
+
+      const text = `⛔ Non sei autorizzato a usare questo bot.\nIl tuo ID utente è: \`${from.id}\``;
       await ctx.reply(text, { parse_mode: "Markdown" });
       return;
     }
 
+    let userRecord: UserIdentity | undefined;
     if (options.userRepository) {
       const displayName =
         [from.first_name, from.last_name].filter(Boolean).join(" ").trim() ||
         null;
-      const userRecord = await options.userRepository.ensureUser(from.id, {
+      userRecord = await options.userRepository.ensureUser(from.id, {
         username: from.username ?? null,
         displayName,
       });
+    }
 
-      if (options.onUserAuthenticated) {
-        await options.onUserAuthenticated(ctx, userRecord);
-      }
+    if (options.onUserAuthenticated) {
+      await options.onUserAuthenticated(ctx, userRecord);
     }
 
     await next();

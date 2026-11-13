@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "domain/**/*.ts",
+    "application/**/*.ts",
+    "interfaces/**/*.ts",
+    "adapters/**/*.ts",
+    "middleware/**/*.ts",
+    "storage/**/*.ts",
+    "tests/**/*.ts"
+  ],
+  "exclude": [
+    "dist"
+  ]
+}

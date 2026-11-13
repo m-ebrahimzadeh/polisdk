@@ -11,6 +11,7 @@ import type {
   LoginCredentials,
   LoginFlowStatus
 } from '../domain/entities.js';
+import { redactSensitiveErrorText } from '../domain/redaction.js';
 import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
 import type {
   AuthPageDriverPort,
@@ -22,7 +23,7 @@ import type {
   LoginProgressCallbacks,
   OtpChallengeProviderPort
 } from '../interfaces/otp-provider-port.js';
-import { createRedactingLogger, redactSensitiveErrorText } from '../middleware/redaction.js';
+import { createRedactingLogger } from './redacting-logger.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -30,7 +31,14 @@ function sleep(ms: number): Promise<void> {
 
 function isTransientNavigationError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|target closed|receiving end does not exist|message port closed/i.test(
+  if (
+    /target closed|page has been closed|browser has been closed|context has been closed|has been closed|tab was closed|no tab with id/i.test(
+      msg
+    )
+  ) {
+    return false;
+  }
+  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|receiving end does not exist|message port closed|receiving end returned empty response|navigating to|navigation in progress|interrupted by.*navigation/i.test(
     msg
   );
 }
@@ -48,6 +56,13 @@ export interface PolimiSessionAuthRequest {
   maxSteps?: number;
   /** Poll delay in milliseconds between intermediate steps. Default: 400. */
   pollDelayMs?: number;
+  /** Maximum manual OTP submission retries before failing deterministically. Default: 3. */
+  maxManualOtpAttempts?: number;
+  /**
+   * Minimum milliseconds to wait for transition or DOM error banner after submitting
+   * credentials or OTP before retrying/falling back. Defaults to `1500` when `pollDelayMs > 0` (`0` otherwise).
+   */
+  postSubmitDebounceMs?: number;
   /** Optional callbacks for live status updates. */
   callbacks?: LoginProgressCallbacks;
   /** Optional hook invoked once an authenticated PoliMi session is established. */
@@ -83,6 +98,13 @@ export interface FederatedSamlAuthRequest {
   maxPollSteps?: number;
   /** SAML transit window duration in ms after initiating SSO or entering transit. Default: 25_000. */
   ssoTransitWindowMs?: number;
+  /** Maximum manual OTP submission retries before failing deterministically. Default: 3. */
+  maxManualOtpAttempts?: number;
+  /**
+   * Minimum milliseconds to wait for PoliMi IdP transition or error banner after submitting
+   * credentials or OTP during SAML SSO. Defaults to `1500` when `pollIntervalMs > 0` (`0` otherwise).
+   */
+  postSubmitDebounceMs?: number;
   callbacks?: LoginProgressCallbacks;
   onAuthenticated?: () => void | Promise<void>;
 }
@@ -102,6 +124,8 @@ export interface FederatedSamlFlowState {
   submittedSamlAutoTotpCount: number;
   submittedSamlManualOtpCount: number;
   explicitOtpToConsume?: string;
+  credentialsDebounceUntil?: number;
+  otpDebounceUntil?: number;
 }
 
 export class PoliAuthOrchestrator {
@@ -128,9 +152,13 @@ export class PoliAuthOrchestrator {
       entryUrl = POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl,
       maxSteps = 40,
       pollDelayMs = 400,
+      maxManualOtpAttempts = 3,
+      postSubmitDebounceMs = pollDelayMs > 0 ? Math.max(1_500, pollDelayMs * 3) : 0,
       callbacks,
       onAuthenticated
     } = req;
+
+    const effectiveMaxManualOtpAttempts = Math.max(1, maxManualOtpAttempts);
 
     const notify = async (status: LoginFlowStatus, msg: string) => {
       await callbacks?.onStatusChange?.(status, msg);
@@ -163,6 +191,8 @@ export class PoliAuthOrchestrator {
       let submittedCredentialsCount = 0;
       let submittedAutoTotpCount = 0;
       let submittedManualOtpCount = 0;
+      let credentialsDebounceUntil = 0;
+      let otpDebounceUntil = 0;
       let explicitOtpToConsume = credentials.otp?.trim() || '';
 
       for (let step = 0; step < maxSteps; step++) {
@@ -203,10 +233,20 @@ export class PoliAuthOrchestrator {
 
         // 3. Credentials form (`IdentificazioneUnica.do`)
         if (stageInfo.stage === 'credentials') {
+          otpDebounceUntil = 0;
           if (submittedCredentialsCount > 0 && stageInfo.errorMessage) {
             const errMsg = `PoliMi login rejected: ${stageInfo.errorMessage}`;
             await notify('failed', errMsg);
             return { ok: false, status: 'failed', error: errMsg };
+          }
+
+          if (
+            submittedCredentialsCount > 0 &&
+            postSubmitDebounceMs > 0 &&
+            Date.now() < credentialsDebounceUntil
+          ) {
+            await sleep(pollDelayMs);
+            continue;
           }
 
           if (submittedCredentialsCount >= 2) {
@@ -245,14 +285,37 @@ export class PoliAuthOrchestrator {
             return { ok: false, status: 'failed', error: errMsg };
           }
 
+          credentialsDebounceUntil = Date.now() + postSubmitDebounceMs;
+          if (postSubmitDebounceMs > 0) {
+            await driver.waitForNavigation(Math.min(postSubmitDebounceMs, 1_500)).catch(() => undefined);
+          }
           if (pollDelayMs > 0) await sleep(Math.min(350, pollDelayMs));
           continue;
         }
 
         // 4. 2FA OTP verification (`form#form_scelta2fa`)
         if (stageInfo.stage === 'otp') {
+          credentialsDebounceUntil = 0;
           if (submittedManualOtpCount > 0 && stageInfo.errorMessage) {
             const errMsg = `PoliMi 2FA OTP rejected: ${stageInfo.errorMessage}`;
+            await notify('failed', errMsg);
+            return { ok: false, status: 'failed', error: errMsg };
+          }
+
+          if (
+            (submittedAutoTotpCount > 0 || submittedManualOtpCount > 0) &&
+            !stageInfo.errorMessage &&
+            postSubmitDebounceMs > 0 &&
+            Date.now() < otpDebounceUntil
+          ) {
+            await sleep(pollDelayMs);
+            continue;
+          }
+
+          if (submittedManualOtpCount >= effectiveMaxManualOtpAttempts) {
+            const errMsg =
+              stageInfo.errorMessage ||
+              `PoliMi 2FA manual OTP exceeded maximum retry attempts (${effectiveMaxManualOtpAttempts}).`;
             await notify('failed', errMsg);
             return { ok: false, status: 'failed', error: errMsg };
           }
@@ -285,9 +348,16 @@ export class PoliAuthOrchestrator {
             return { ok: false, status: 'failed', error: errMsg };
           }
 
+          otpDebounceUntil = Date.now() + postSubmitDebounceMs;
+          if (postSubmitDebounceMs > 0) {
+            await driver.waitForNavigation(Math.min(postSubmitDebounceMs, 1_500)).catch(() => undefined);
+          }
           if (pollDelayMs > 0) await sleep(Math.min(450, pollDelayMs));
           continue;
         }
+
+        credentialsDebounceUntil = 0;
+        otpDebounceUntil = 0;
 
         // 5. Intermediate SSO handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`) or loading
         await sleep(pollDelayMs);
@@ -318,6 +388,8 @@ export class PoliAuthOrchestrator {
     federatedIdentifier?: string;
     state: FederatedSamlFlowState;
     ssoTransitWindowMs?: number;
+    maxManualOtpAttempts?: number;
+    postSubmitDebounceMs?: number;
     callbacks?: LoginProgressCallbacks;
   }): Promise<
     | { action: 'continue_polling' }
@@ -332,8 +404,12 @@ export class PoliAuthOrchestrator {
       federatedIdentifier,
       state,
       ssoTransitWindowMs = 25_000,
+      maxManualOtpAttempts = 3,
+      postSubmitDebounceMs = 1_500,
       callbacks
     } = params;
+
+    const effectiveMaxManualOtpAttempts = Math.max(1, maxManualOtpAttempts);
 
     let polimiStage = null;
     try {
@@ -353,6 +429,8 @@ export class PoliAuthOrchestrator {
 
     // 1. PoliMi expired session / security violation recovery during SAML SSO
     if (polimiStage && polimiStage.stage === 'session_expired') {
+      state.credentialsDebounceUntil = 0;
+      state.otpDebounceUntil = 0;
       state.ssoTransitDeadline = Math.max(
         state.ssoTransitDeadline,
         Date.now() + ssoTransitWindowMs
@@ -367,6 +445,8 @@ export class PoliAuthOrchestrator {
 
     // 2. Intermediate PoliMi SSO handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`)
     if (polimiStage && polimiStage.stage === 'sso_handoff') {
+      state.credentialsDebounceUntil = 0;
+      state.otpDebounceUntil = 0;
       state.ssoTransitDeadline = Math.max(
         state.ssoTransitDeadline,
         Date.now() + ssoTransitWindowMs
@@ -376,6 +456,7 @@ export class PoliAuthOrchestrator {
 
     // 3. PoliMi credentials form encountered during SAML SSO
     if (polimiStage && polimiStage.stage === 'credentials') {
+      state.otpDebounceUntil = 0;
       state.ssoTransitDeadline = Math.max(
         state.ssoTransitDeadline,
         Date.now() + ssoTransitWindowMs
@@ -391,6 +472,14 @@ export class PoliAuthOrchestrator {
           action: 'login_required',
           reason: `PoliMi login rejected: ${polimiStage.errorMessage}`
         };
+      }
+
+      if (
+        state.submittedSamlCredentialsCount > 0 &&
+        postSubmitDebounceMs > 0 &&
+        Date.now() < (state.credentialsDebounceUntil ?? 0)
+      ) {
+        return { action: 'continue_polling' };
       }
 
       if (state.submittedSamlCredentialsCount >= 2) {
@@ -430,11 +519,13 @@ export class PoliAuthOrchestrator {
             'Failed to submit PoliMi credentials during SAML SSO.'
         };
       }
+      state.credentialsDebounceUntil = Date.now() + postSubmitDebounceMs;
       return { action: 'continue_polling' };
     }
 
     // 4. PoliMi 2FA OTP prompt encountered during SAML SSO
     if (polimiStage && polimiStage.stage === 'otp') {
+      state.credentialsDebounceUntil = 0;
       state.ssoTransitDeadline = Math.max(
         state.ssoTransitDeadline,
         Date.now() + ssoTransitWindowMs
@@ -444,6 +535,24 @@ export class PoliAuthOrchestrator {
         return {
           action: 'login_required',
           reason: `PoliMi 2FA OTP rejected: ${polimiStage.errorMessage}`
+        };
+      }
+
+      if (
+        (state.submittedSamlAutoTotpCount > 0 || state.submittedSamlManualOtpCount > 0) &&
+        !polimiStage.errorMessage &&
+        postSubmitDebounceMs > 0 &&
+        Date.now() < (state.otpDebounceUntil ?? 0)
+      ) {
+        return { action: 'continue_polling' };
+      }
+
+      if (state.submittedSamlManualOtpCount >= effectiveMaxManualOtpAttempts) {
+        return {
+          action: 'login_required',
+          reason:
+            polimiStage.errorMessage ||
+            `PoliMi 2FA manual OTP exceeded maximum retry attempts (${effectiveMaxManualOtpAttempts}).`
         };
       }
 
@@ -476,8 +585,12 @@ export class PoliAuthOrchestrator {
           reason: otpRes.error || 'Failed to submit 2FA OTP during SAML SSO.'
         };
       }
+      state.otpDebounceUntil = Date.now() + postSubmitDebounceMs;
       return { action: 'continue_polling' };
     }
+
+    state.credentialsDebounceUntil = 0;
+    state.otpDebounceUntil = 0;
 
     // 5. Check Federated SP SSO state
     const fedDriver = driver as Partial<FederatedSsoPageDriverPort>;
@@ -520,60 +633,83 @@ export class PoliAuthOrchestrator {
     }
 
     // Mode A: SP presents an identifier-discovery (email / username) prompt
-    if (ssoInspection.isIdentifierPrompt && !state.submittedIdentifier) {
-      const identifier = (federatedIdentifier ?? credentials.polimiEmail ?? '').trim();
-      if (!identifier) {
-        return {
-          action: 'login_required',
-          reason: `Federated SAML SSO (${ssoInspection.providerId}) requires a federatedIdentifier (or credentials.polimiEmail), but none was provided.`
-        };
+    if (ssoInspection.isIdentifierPrompt) {
+      if (!state.submittedIdentifier) {
+        const identifier = (federatedIdentifier ?? credentials.polimiEmail ?? '').trim();
+        if (!identifier) {
+          return {
+            action: 'login_required',
+            reason: `Federated SAML SSO (${ssoInspection.providerId}) requires a federatedIdentifier (or credentials.polimiEmail), but none was provided.`
+          };
+        }
+
+        if (!fedDriver.submitFederatedIdentifier) {
+          return {
+            action: 'failed',
+            reason: 'Driver does not support federated SSO identifier submission.'
+          };
+        }
+
+        state.submittedIdentifier = true;
+        state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
+        const submitRes = await fedDriver.submitFederatedIdentifier(identifier);
+        if (!submitRes.ok) {
+          return {
+            action: 'login_required',
+            reason: submitRes.error || 'Failed to submit federated SSO identifier.'
+          };
+        }
+        return { action: 'continue_polling' };
       }
 
-      if (!fedDriver.submitFederatedIdentifier) {
-        return {
-          action: 'failed',
-          reason: 'Driver does not support federated SSO identifier submission.'
-        };
+      if (Date.now() < state.ssoTransitDeadline) {
+        return { action: 'continue_polling' };
       }
 
-      state.submittedIdentifier = true;
-      state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
-      const submitRes = await fedDriver.submitFederatedIdentifier(identifier);
-      if (!submitRes.ok) {
-        return {
-          action: 'login_required',
-          reason: submitRes.error || 'Failed to submit federated SSO identifier.'
-        };
-      }
-      return { action: 'continue_polling' };
+      return {
+        action: 'login_required',
+        reason:
+          ssoInspection.reason ||
+          'Timed out waiting for federated SP navigation after submitting identifier.'
+      };
     }
 
     // Mode B: SP presents a click-through SSO login trigger (no email prompt required)
-    if (ssoInspection.isLoginTrigger && !state.triggeredLogin) {
-      if (!fedDriver.triggerFederatedLogin) {
-        return {
-          action: 'failed',
-          reason: 'Driver does not support federated SSO login trigger.'
-        };
+    if (ssoInspection.isLoginTrigger) {
+      if (!state.triggeredLogin) {
+        if (!fedDriver.triggerFederatedLogin) {
+          return {
+            action: 'failed',
+            reason: 'Driver does not support federated SSO login trigger.'
+          };
+        }
+
+        state.triggeredLogin = true;
+        state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
+        const triggerRes = await fedDriver.triggerFederatedLogin();
+        if (!triggerRes.ok) {
+          return {
+            action: 'login_required',
+            reason: triggerRes.error || 'Failed to trigger federated SSO login.'
+          };
+        }
+        return { action: 'continue_polling' };
       }
 
-      state.triggeredLogin = true;
-      state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
-      const triggerRes = await fedDriver.triggerFederatedLogin();
-      if (!triggerRes.ok) {
-        return {
-          action: 'login_required',
-          reason: triggerRes.error || 'Failed to trigger federated SSO login.'
-        };
+      if (Date.now() < state.ssoTransitDeadline) {
+        return { action: 'continue_polling' };
       }
-      return { action: 'continue_polling' };
+
+      return {
+        action: 'login_required',
+        reason:
+          ssoInspection.reason ||
+          'Timed out waiting for federated SP navigation after triggering SSO login.'
+      };
     }
 
-    // Mode C / SAML transit polling window
-    if (
-      ssoInspection.status === 'sso_in_transit' &&
-      (ssoInspection.isSamlTransitPage || state.submittedIdentifier || state.triggeredLogin)
-    ) {
+    // Mode C / SAML transit polling window (includes initial interstitial/blank pages)
+    if (ssoInspection.status === 'sso_in_transit') {
       if (state.ssoTransitDeadline === 0) {
         state.ssoTransitDeadline = Date.now() + ssoTransitWindowMs;
       }
@@ -603,6 +739,8 @@ export class PoliAuthOrchestrator {
       pollIntervalMs = 250,
       maxPollSteps = 180,
       ssoTransitWindowMs = 25_000,
+      maxManualOtpAttempts = 3,
+      postSubmitDebounceMs = pollIntervalMs > 0 ? Math.max(1_500, pollIntervalMs * 4) : 0,
       callbacks,
       onAuthenticated
     } = req;
@@ -654,6 +792,8 @@ export class PoliAuthOrchestrator {
           federatedIdentifier,
           state,
           ssoTransitWindowMs,
+          maxManualOtpAttempts,
+          postSubmitDebounceMs,
           callbacks
         });
 

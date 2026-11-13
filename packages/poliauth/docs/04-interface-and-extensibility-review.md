@@ -118,7 +118,7 @@ The previously monolithic `SessionContextPoolPort` was segregated into focused r
 ### 3.4 Storage & Key Derivation Ports (`interfaces/storage-port.ts`)
 
 - **`VaultStoragePort`**: Pure key-value persistence (`get`, `set`, `remove`). Storage backends do not need to know about encryption keys.
-- **`VaultSecretMaterialPort`**: Segregated role interface providing custom secret material for PBKDF2 key derivation (`getSecretMaterial()`). Implemented by `SqliteVaultStorageBackend` and `InMemoryVaultStorage`.
+- **`VaultSecretMaterialPort`**: Segregated role interface providing custom secret material for PBKDF2 key derivation (`getSecretMaterial()`). Implemented by `InMemoryVaultStorage`, `ChromeLocalVaultStorage`, and `SqliteVaultStorageBackend`.
 - **`UserIdentityRepositoryPort`**: Segregated into `UserIdentityProvisionerPort` (`ensureUser`), `UserIdentityReaderPort` (`getUser`, `listUsers`), and `UserIdentityWriterPort` (`updateUser`, `updateLoginStatus`, `deleteUser`).
 
 ### 3.5 Authorization Ports (`interfaces/authorization-port.ts`)
@@ -230,4 +230,4 @@ export class RedisVaultStorage implements VaultStoragePort, VaultSecretMaterialP
 | Spec-driven federated drivers (zero legacy shims) | `WebexSamlProviderAdapter` wraps `WEBEX_SAML_FLOW_SPEC`; Playwright & Chrome drivers inject `FederatedSsoProviderSpec` directly; legacy shims purged | Verified |
 | Storage & Session Pool ISP | Segregated interfaces with composite backwards-compatible ports | Verified |
 | Typecheck across all 5 packages | 0 errors (`npm run typecheck`) | Verified |
-| Vitest test suites | 10/10 test files, 50/50 tests passing (`npm test`) | Verified |
+| Vitest test suites | 13/13 test files, 70/70 tests passing (`npm test`) | Verified |

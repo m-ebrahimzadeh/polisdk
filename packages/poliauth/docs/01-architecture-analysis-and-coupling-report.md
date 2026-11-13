@@ -20,6 +20,7 @@ flowchart TD
     Wizard["application/credential-wizard.ts"]
     Authz["application/authorization.ts"]
     Orch["application/login-orchestrator.ts"]
+    RedactLog["application/redacting-logger.ts"]
   end
 
   subgraph Domain["Pure Enterprise Domain (domain/)"]
@@ -27,6 +28,7 @@ flowchart TD
     Creds["domain/credentials.ts"]
     FlowSpec["domain/login-flow-spec.ts"]
     Totp["domain/totp.ts"]
+    Redact["domain/redaction.ts"]
   end
 
   subgraph Ports["Hexagonal Ports (interfaces/)"]
@@ -62,7 +64,6 @@ flowchart TD
   Client --> Application
   Client --> Domain
   Client --> Storage
-  Client --> Middleware
   Application --> Domain
   Application --> Ports
   Ports --> Domain
@@ -70,6 +71,8 @@ flowchart TD
   Storage --> Ports
   Adapters --> Domain
   Adapters --> Ports
+  Middleware --> Domain
+  Middleware --> Application
   Middleware --> Ports
 ```
 
@@ -79,5 +82,5 @@ flowchart TD
 
 | Layer | Directory | Files | Responsibilities |
 | :--- | :--- | :--- | :--- |
-| **Enterprise Domain** | `domain/` | `entities.ts`, `credentials.ts`, `totp.ts`, `login-flow-spec.ts` | Stateless models, value objects, credential validation/masking rules, RFC 6238 TOTP computation, and PoliMi SSO protocol specification. |
-| **Application Use Cases** | `application/` | `login-orchestrator.ts`, `otp-challenge.ts`, `credential-wizard.ts`, `authorization.ts` | Stateful workflow orchestration (`PoliAuthOrchestrator`), asynchronous 2FA challenge coordination (`OtpChallengeCoordinator`), onboarding wizard state machine (`CredentialSetupWizard`), and RBAC/resource authorization (`AuthorizationService`). |
+| **Enterprise Domain** | `domain/` | `entities.ts`, `credentials.ts`, `totp.ts`, `login-flow-spec.ts`, `redaction.ts` | Stateless models, value objects, credential validation/masking rules, secret redaction primitives, RFC 6238 TOTP computation, and PoliMi SSO protocol specification. |
+| **Application Use Cases** | `application/` | `login-orchestrator.ts`, `otp-challenge.ts`, `credential-wizard.ts`, `authorization.ts`, `redacting-logger.ts` | Stateful workflow orchestration (`PoliAuthOrchestrator`), asynchronous 2FA challenge coordination (`OtpChallengeCoordinator`), onboarding wizard state machine (`CredentialSetupWizard`), RBAC/resource authorization (`AuthorizationService`), and logger redaction decorator (`createRedactingLogger`). |

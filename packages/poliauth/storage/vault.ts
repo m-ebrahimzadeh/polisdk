@@ -1,5 +1,6 @@
 import type { SavedVaultCredentials, IdentityId } from '../domain/entities.js';
 import { mergeVaultCredentials } from '../domain/credentials.js';
+import { redactSensitiveErrorText } from '../domain/redaction.js';
 import type { EncryptedPayload, VaultMetadata } from '../interfaces/crypto-port.js';
 import type { VaultStoragePort, UserVaultStorageFactoryPort, VaultSecretMaterialPort } from '../interfaces/storage-port.js';
 import type { AuthLoggerPort } from '../interfaces/logger-port.js';
@@ -19,6 +20,11 @@ export interface VaultCryptoOptions {
    * Custom master secret material for PBKDF2 key derivation.
    */
   secretMaterial?: string;
+  /**
+   * When true, refuse encryption or decryption if no non-empty secret material
+   * is supplied via `options.secretMaterial` or `VaultSecretMaterialPort`.
+   */
+  requireSecretMaterial?: boolean;
   /**
    * Optional logger for diagnostic output on decryption errors.
    */
@@ -53,22 +59,40 @@ function normalizeKeyArray(keys: string | string[]): string[] {
   return Array.isArray(keys) ? keys : [keys];
 }
 
-function formatScopedKeyMaterial(domain: string, overrideSecret?: string): string {
-  const secret =
-    overrideSecret && overrideSecret.trim().length > 0
-      ? overrideSecret.trim()
-      : 'poliauth-default-local-secret-v1';
+function normalizeSecretMaterial(secret?: string): string | undefined {
+  if (typeof secret !== 'string') {
+    return undefined;
+  }
+  const trimmed = secret.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function formatScopedKeyMaterial(
+  domain: string,
+  overrideSecret?: string,
+  requireSecretMaterial = false
+): string {
+  const normalized = normalizeSecretMaterial(overrideSecret);
+  if (!normalized && requireSecretMaterial) {
+    throw new Error(
+      `Missing non-empty secret material for AES-256-GCM key derivation (${domain}). Refusing to fall back to the default local secret.`
+    );
+  }
+  const secret = normalized ?? 'poliauth-default-local-secret-v1';
   return `PoliAuth::${domain}::v1::${secret}::AES-256-GCM`;
 }
 
 async function deriveAesKey(
   salt: Uint8Array,
   domain: string,
-  secretOverride?: string
+  secretOverride?: string,
+  requireSecretMaterial = false
 ): Promise<CryptoKey> {
   const webCrypto = getWebCrypto();
   const encoder = new TextEncoder();
-  const rawMaterial = encoder.encode(formatScopedKeyMaterial(domain, secretOverride));
+  const rawMaterial = encoder.encode(
+    formatScopedKeyMaterial(domain, secretOverride, requireSecretMaterial)
+  );
 
   const baseKey = await webCrypto.subtle.importKey(
     'raw',
@@ -95,24 +119,48 @@ async function deriveAesKey(
   );
 }
 
-async function getOrCreateSalt(
+const storageMutationQueues = new WeakMap<VaultStoragePort, Promise<void>>();
+
+async function withStorageMutationLock<T>(
+  storage: VaultStoragePort,
+  task: () => Promise<T>
+): Promise<T> {
+  const previous = storageMutationQueues.get(storage) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = previous.then(() => current, () => current);
+  storageMutationQueues.set(storage, chained);
+
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+    if (storageMutationQueues.get(storage) === chained) {
+      storageMutationQueues.delete(storage);
+    }
+  }
+}
+
+async function resolveSaltAndMeta(
   storage: VaultStoragePort,
   metaKey: string
-): Promise<Uint8Array> {
+): Promise<{ salt: Uint8Array; metaToPersist?: VaultMetadata }> {
   const webCrypto = getWebCrypto();
   const data = await storage.get([metaKey]);
   const existingMeta = data[metaKey] as VaultMetadata | undefined;
   if (existingMeta?.salt && existingMeta.version === 1) {
-    return base64ToBytes(existingMeta.salt);
+    return { salt: base64ToBytes(existingMeta.salt) };
   }
 
   const salt = webCrypto.getRandomValues(new Uint8Array(SALT_BYTES));
-  const meta: VaultMetadata = {
+  const metaToPersist: VaultMetadata = {
     salt: bytesToBase64(salt),
     version: 1
   };
-  await storage.set({ [metaKey]: meta });
-  return salt;
+  return { salt, metaToPersist };
 }
 
 /**
@@ -161,21 +209,56 @@ export function getDefaultStorageBackend(): VaultStoragePort {
   };
 }
 
+function resolveEffectiveSecretMaterial(
+  storage: VaultStoragePort,
+  options?: VaultCryptoOptions
+): { secretMaterial?: string; requireSecretMaterial: boolean } {
+  const secretPort = storage as Partial<VaultSecretMaterialPort>;
+  const secretMaterial =
+    normalizeSecretMaterial(options?.secretMaterial) ??
+    normalizeSecretMaterial(secretPort.getSecretMaterial?.());
+  const requireSecretMaterial = Boolean(
+    options?.requireSecretMaterial || secretPort.requiresSecretMaterial
+  );
+  if (requireSecretMaterial && !secretMaterial) {
+    throw new Error(
+      'Missing non-empty secret material for vault operation. Refusing to fall back to the default local secret.'
+    );
+  }
+  return { secretMaterial, requireSecretMaterial };
+}
+
+function normalizeCryptoOptions(
+  secretOrOptions?: string | VaultCryptoOptions,
+  logger?: AuthLoggerPort
+): VaultCryptoOptions | undefined {
+  if (typeof secretOrOptions === 'string') {
+    return { secretMaterial: secretOrOptions, logger };
+  }
+  if (secretOrOptions) {
+    return logger && !secretOrOptions.logger
+      ? { ...secretOrOptions, logger }
+      : secretOrOptions;
+  }
+  return logger ? { logger } : undefined;
+}
+
 async function encryptJsonValue(
   value: unknown,
   storage: VaultStoragePort,
   payloadKey: string,
   metaKey: string,
   domain: string,
-  secretMaterial?: string
+  options?: VaultCryptoOptions
 ): Promise<void> {
   const webCrypto = getWebCrypto();
-  const effectiveSecret =
-    secretMaterial ??
-    (storage as Partial<VaultSecretMaterialPort>).getSecretMaterial?.();
-  const salt = await getOrCreateSalt(storage, metaKey);
+  const { secretMaterial, requireSecretMaterial } = resolveEffectiveSecretMaterial(
+    storage,
+    options
+  );
+  const { salt, metaToPersist } = await resolveSaltAndMeta(storage, metaKey);
   const iv = webCrypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const key = await deriveAesKey(salt, domain, effectiveSecret);
+  const key = await deriveAesKey(salt, domain, secretMaterial, requireSecretMaterial);
 
   const encoder = new TextEncoder();
   const plaintext = encoder.encode(JSON.stringify(value));
@@ -192,9 +275,82 @@ async function encryptJsonValue(
     updatedAt: Date.now()
   };
 
-  await storage.set({
+  const itemsToSet: Record<string, unknown> = {
     [payloadKey]: payload
-  });
+  };
+  if (metaToPersist) {
+    itemsToSet[metaKey] = metaToPersist;
+  }
+
+  await storage.set(itemsToSet);
+}
+
+type DecryptJsonResult<T> =
+  | { status: 'ok'; value: T }
+  | { status: 'empty' }
+  | { status: 'corrupt'; reason: string }
+  | { status: 'decryption_failed'; reason: string };
+
+async function decryptJsonValueDetailed<T>(
+  storage: VaultStoragePort,
+  payloadKey: string,
+  metaKey: string,
+  domain: string,
+  options?: VaultCryptoOptions
+): Promise<DecryptJsonResult<T>> {
+  const webCrypto = getWebCrypto();
+  const { secretMaterial, requireSecretMaterial } = resolveEffectiveSecretMaterial(
+    storage,
+    options
+  );
+  const data = await storage.get([payloadKey, metaKey]);
+  const payload = data[payloadKey] as EncryptedPayload | undefined;
+  const meta = data[metaKey] as VaultMetadata | undefined;
+
+  if (payload === undefined) {
+    return { status: 'empty' };
+  }
+
+  if (
+    !payload ||
+    typeof payload !== 'object' ||
+    payload.version !== 1 ||
+    typeof payload.iv !== 'string' ||
+    !payload.iv ||
+    typeof payload.ciphertext !== 'string' ||
+    !payload.ciphertext ||
+    !meta ||
+    typeof meta !== 'object' ||
+    typeof meta.salt !== 'string' ||
+    !meta.salt
+  ) {
+    const reason = 'Corrupted or incomplete encrypted vault envelope.';
+    options?.logger?.warn(`Corrupted vault payload (${payloadKey}): ${reason}`);
+    return { status: 'corrupt', reason };
+  }
+
+  try {
+    const salt = base64ToBytes(meta.salt);
+    const iv = base64ToBytes(payload.iv);
+    const ciphertext = base64ToBytes(payload.ciphertext);
+    const key = await deriveAesKey(salt, domain, secretMaterial, requireSecretMaterial);
+
+    const decryptedBuffer = await webCrypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv as BufferSource },
+      key,
+      ciphertext as BufferSource
+    );
+
+    const decoder = new TextDecoder();
+    return {
+      status: 'ok',
+      value: JSON.parse(decoder.decode(decryptedBuffer)) as T
+    };
+  } catch (err) {
+    const reason = redactSensitiveErrorText(err);
+    options?.logger?.warn(`Failed to decrypt vault payload (${payloadKey}): ${reason}`);
+    return { status: 'decryption_failed', reason };
+  }
 }
 
 async function decryptJsonValue<T>(
@@ -204,36 +360,8 @@ async function decryptJsonValue<T>(
   domain: string,
   options?: VaultCryptoOptions
 ): Promise<T | null> {
-  const webCrypto = getWebCrypto();
-  const data = await storage.get([payloadKey, metaKey]);
-  const payload = data[payloadKey] as EncryptedPayload | undefined;
-  const meta = data[metaKey] as VaultMetadata | undefined;
-
-  if (!payload || payload.version !== 1 || !payload.iv || !payload.ciphertext || !meta?.salt) {
-    return null;
-  }
-
-  try {
-    const effectiveSecret =
-      options?.secretMaterial ??
-      (storage as Partial<VaultSecretMaterialPort>).getSecretMaterial?.();
-    const salt = base64ToBytes(meta.salt);
-    const iv = base64ToBytes(payload.iv);
-    const ciphertext = base64ToBytes(payload.ciphertext);
-    const key = await deriveAesKey(salt, domain, effectiveSecret);
-
-    const decryptedBuffer = await webCrypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: iv as BufferSource },
-      key,
-      ciphertext as BufferSource
-    );
-
-    const decoder = new TextDecoder();
-    return JSON.parse(decoder.decode(decryptedBuffer)) as T;
-  } catch (err) {
-    options?.logger?.warn(`Failed to decrypt vault payload (${payloadKey})`, err);
-    return null;
-  }
+  const result = await decryptJsonValueDetailed<T>(storage, payloadKey, metaKey, domain, options);
+  return result.status === 'ok' ? result.value : null;
 }
 
 /**
@@ -245,19 +373,34 @@ export async function saveEncryptedCredentials(
   storage: VaultStoragePort = getDefaultStorageBackend(),
   options?: VaultCryptoOptions
 ): Promise<SavedVaultCredentials> {
-  const existing = await loadEncryptedCredentials(storage, options);
-  const merged = mergeVaultCredentials(existing, creds, Date.now());
+  return withStorageMutationLock(storage, async () => {
+    const existingResult = await decryptJsonValueDetailed<SavedVaultCredentials>(
+      storage,
+      VAULT_STORAGE_KEY,
+      VAULT_META_KEY,
+      'VaultKey',
+      options
+    );
+    if (existingResult.status === 'corrupt' || existingResult.status === 'decryption_failed') {
+      throw new Error(
+        `Refusing to overwrite existing encrypted vault (${VAULT_STORAGE_KEY}): ${existingResult.reason}. Call clearEncryptedCredentials() before saving new credentials.`
+      );
+    }
 
-  await encryptJsonValue(
-    merged,
-    storage,
-    VAULT_STORAGE_KEY,
-    VAULT_META_KEY,
-    'VaultKey',
-    options?.secretMaterial
-  );
+    const existing = existingResult.status === 'ok' ? existingResult.value : null;
+    const merged = mergeVaultCredentials(existing, creds, Date.now());
 
-  return merged;
+    await encryptJsonValue(
+      merged,
+      storage,
+      VAULT_STORAGE_KEY,
+      VAULT_META_KEY,
+      'VaultKey',
+      options
+    );
+
+    return merged;
+  });
 }
 
 /**
@@ -283,7 +426,9 @@ export async function loadEncryptedCredentials(
 export async function clearEncryptedCredentials(
   storage: VaultStoragePort = getDefaultStorageBackend()
 ): Promise<void> {
-  await storage.remove([VAULT_STORAGE_KEY, VAULT_META_KEY]);
+  await withStorageMutationLock(storage, async () => {
+    await storage.remove([VAULT_STORAGE_KEY, VAULT_META_KEY]);
+  });
 }
 
 /**
@@ -292,16 +437,18 @@ export async function clearEncryptedCredentials(
 export async function saveEncryptedSessionState(
   storage: VaultStoragePort,
   sessionState: unknown,
-  secretMaterial?: string
+  secretOrOptions?: string | VaultCryptoOptions
 ): Promise<void> {
-  await encryptJsonValue(
-    sessionState,
-    storage,
-    SESSION_STATE_STORAGE_KEY,
-    SESSION_STATE_META_KEY,
-    'SessionStateKey',
-    secretMaterial
-  );
+  await withStorageMutationLock(storage, async () => {
+    await encryptJsonValue(
+      sessionState,
+      storage,
+      SESSION_STATE_STORAGE_KEY,
+      SESSION_STATE_META_KEY,
+      'SessionStateKey',
+      normalizeCryptoOptions(secretOrOptions)
+    );
+  });
 }
 
 /**
@@ -309,7 +456,7 @@ export async function saveEncryptedSessionState(
  */
 export async function loadEncryptedSessionState<T = unknown>(
   storage: VaultStoragePort,
-  secretMaterial?: string,
+  secretOrOptions?: string | VaultCryptoOptions,
   logger?: AuthLoggerPort
 ): Promise<T | null> {
   return decryptJsonValue<T>(
@@ -317,7 +464,7 @@ export async function loadEncryptedSessionState<T = unknown>(
     SESSION_STATE_STORAGE_KEY,
     SESSION_STATE_META_KEY,
     'SessionStateKey',
-    { secretMaterial, logger }
+    normalizeCryptoOptions(secretOrOptions, logger)
   );
 }
 
@@ -325,7 +472,9 @@ export async function loadEncryptedSessionState<T = unknown>(
  * Removes encrypted session state and metadata from the given storage backend.
  */
 export async function clearEncryptedSessionState(storage: VaultStoragePort): Promise<void> {
-  await storage.remove([SESSION_STATE_STORAGE_KEY, SESSION_STATE_META_KEY]);
+  await withStorageMutationLock(storage, async () => {
+    await storage.remove([SESSION_STATE_STORAGE_KEY, SESSION_STATE_META_KEY]);
+  });
 }
 
 /**
@@ -336,6 +485,7 @@ export class EncryptedCredentialVault {
   private readonly singleStorage?: VaultStoragePort;
   private readonly userFactory?: UserVaultStorageFactoryPort;
   private readonly cryptoOptions?: VaultCryptoOptions;
+  private readonly identityMutationQueues = new Map<string, Promise<void>>();
 
   constructor(options: {
     storage?: VaultStoragePort;
@@ -345,6 +495,30 @@ export class EncryptedCredentialVault {
     this.singleStorage = options.storage;
     this.userFactory = options.userFactory;
     this.cryptoOptions = options.cryptoOptions;
+  }
+
+  private async withIdentityMutationLock<T>(
+    identityId: IdentityId | undefined,
+    task: () => Promise<T>
+  ): Promise<T> {
+    const lockKey = identityId === undefined ? '__single__' : `user:${String(identityId)}`;
+    const previous = this.identityMutationQueues.get(lockKey) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = previous.then(() => current, () => current);
+    this.identityMutationQueues.set(lockKey, chained);
+
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.identityMutationQueues.get(lockKey) === chained) {
+        this.identityMutationQueues.delete(lockKey);
+      }
+    }
   }
 
   private resolveStorage(identityId?: IdentityId, secretOverride?: string): {
@@ -373,8 +547,10 @@ export class EncryptedCredentialVault {
     identityId?: IdentityId,
     secretOverride?: string
   ): Promise<SavedVaultCredentials> {
-    const { storage, cryptoOptions } = this.resolveStorage(identityId, secretOverride);
-    return saveEncryptedCredentials(creds, storage, cryptoOptions);
+    return this.withIdentityMutationLock(identityId, () => {
+      const { storage, cryptoOptions } = this.resolveStorage(identityId, secretOverride);
+      return saveEncryptedCredentials(creds, storage, cryptoOptions);
+    });
   }
 
   async loadCredentials(
@@ -386,8 +562,10 @@ export class EncryptedCredentialVault {
   }
 
   async clearCredentials(identityId?: IdentityId, secretOverride?: string): Promise<void> {
-    const { storage } = this.resolveStorage(identityId, secretOverride);
-    await clearEncryptedCredentials(storage);
+    await this.withIdentityMutationLock(identityId, async () => {
+      const { storage } = this.resolveStorage(identityId, secretOverride);
+      await clearEncryptedCredentials(storage);
+    });
   }
 
   async saveSessionState<T = unknown>(
@@ -395,8 +573,10 @@ export class EncryptedCredentialVault {
     identityId?: IdentityId,
     secretOverride?: string
   ): Promise<void> {
-    const { storage, cryptoOptions } = this.resolveStorage(identityId, secretOverride);
-    await saveEncryptedSessionState(storage, state, cryptoOptions?.secretMaterial);
+    await this.withIdentityMutationLock(identityId, async () => {
+      const { storage, cryptoOptions } = this.resolveStorage(identityId, secretOverride);
+      await saveEncryptedSessionState(storage, state, cryptoOptions);
+    });
   }
 
   async loadSessionState<T = unknown>(
@@ -404,15 +584,13 @@ export class EncryptedCredentialVault {
     secretOverride?: string
   ): Promise<T | null> {
     const { storage, cryptoOptions } = this.resolveStorage(identityId, secretOverride);
-    return loadEncryptedSessionState<T>(
-      storage,
-      cryptoOptions?.secretMaterial,
-      cryptoOptions?.logger
-    );
+    return loadEncryptedSessionState<T>(storage, cryptoOptions);
   }
 
   async clearSessionState(identityId?: IdentityId, secretOverride?: string): Promise<void> {
-    const { storage } = this.resolveStorage(identityId, secretOverride);
-    await clearEncryptedSessionState(storage);
+    await this.withIdentityMutationLock(identityId, async () => {
+      const { storage } = this.resolveStorage(identityId, secretOverride);
+      await clearEncryptedSessionState(storage);
+    });
   }
 }

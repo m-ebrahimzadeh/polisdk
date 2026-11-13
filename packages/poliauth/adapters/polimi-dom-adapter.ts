@@ -15,6 +15,23 @@ function getPageUrl(loc: PageLocationSnapshot): string {
   return loc.href || `${loc.pathname}${loc.search ?? ''}`;
 }
 
+function isPolimiHostname(hostname: string): boolean {
+  const lower = (hostname || '').toLowerCase();
+  return lower === 'polimi.it' || lower.endsWith('.polimi.it');
+}
+
+function isPolimiIdpLocation(loc: PageLocationSnapshot): boolean {
+  const lowerHost = (loc.hostname || '').toLowerCase();
+  const idpHost = POLIMI_LOGIN_FLOW_SPEC.entry.idpHostname.toLowerCase();
+  if (lowerHost === idpHost || lowerHost.endsWith(`.${idpHost}`)) {
+    return true;
+  }
+  return (
+    isPolimiHostname(lowerHost) &&
+    (loc.pathname || '').includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpPathnameSubstring)
+  );
+}
+
 /**
  * Checks whether the current DOM and location correspond to a PoliMi login, 2FA, or session error page.
  */
@@ -31,9 +48,9 @@ export function isPolimiLoginPage(doc: Document, loc: PageLocationSnapshot): boo
   }
 
   if (
-    loc.hostname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpHostname) ||
-    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpPathnameSubstring) ||
-    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker)
+    isPolimiIdpLocation(loc) ||
+    (isPolimiHostname(loc.hostname) &&
+      loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker))
   ) {
     return true;
   }
@@ -52,14 +69,21 @@ export function isPolimiAuthenticatedSessionPage(
     return false;
   }
 
+  if (!isPolimiHostname(loc.hostname)) {
+    return false;
+  }
+
   for (const selector of POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.authenticatedDomSelectors) {
     if (doc.querySelector(selector)) {
       return true;
     }
   }
 
+  const lowerHost = (loc.hostname || '').toLowerCase();
+  const portalHost = POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.portalHostname.toLowerCase();
   if (
-    loc.hostname.includes(POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.portalHostname) ||
+    lowerHost === portalHost ||
+    lowerHost.endsWith(`.${portalHost}`) ||
     loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.portalPathnameSubstring)
   ) {
     return true;
@@ -89,17 +113,21 @@ export function inspectPolimiPageStage(
       .querySelector(POLIMI_LOGIN_FLOW_SPEC.credentialsPage.errorAlertSelector)
       ?.textContent?.trim() || undefined;
 
-  // 1. Session Expired / Terminated Security Violation page
+  // 1. Session Expired / Terminated Security Violation page (scoped to PoliMi IdP)
+  const onPolimiIdp = isPolimiIdpLocation(loc);
   const bodyText = (doc.body?.textContent ?? '').toLowerCase();
-  const continueLink = doc.querySelector<HTMLAnchorElement>(
-    POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.continueToPortalLink
-  );
+  const continueLink = onPolimiIdp
+    ? doc.querySelector<HTMLAnchorElement>(
+        POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.continueToPortalLink
+      )
+    : null;
   if (
-    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker) ||
-    POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredTextMarkers.some((marker) =>
-      bodyText.includes(marker)
-    ) ||
-    (continueLink && loc.hostname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpHostname))
+    onPolimiIdp &&
+    (loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker) ||
+      POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredTextMarkers.some((marker) =>
+        bodyText.includes(marker)
+      ) ||
+      Boolean(continueLink))
   ) {
     return {
       stage: 'session_expired',

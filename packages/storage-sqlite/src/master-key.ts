@@ -38,14 +38,30 @@ export function resolveMasterEncryptionKey(options: MasterKeyOptions): string {
   const keyDir = path.dirname(keyFile);
   fs.mkdirSync(keyDir, { recursive: true });
 
-  if (fs.existsSync(keyFile)) {
-    const existing = fs.readFileSync(keyFile, "utf8").trim();
-    if (existing.length >= minLength) {
-      return existing;
-    }
-  }
-
   const generated = crypto.randomBytes(32).toString("base64url");
-  fs.writeFileSync(keyFile, `${generated}\n`, { mode: 0o600 });
-  return generated;
+  try {
+    fs.writeFileSync(keyFile, `${generated}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    try {
+      fs.chmodSync(keyFile, 0o600);
+    } catch {
+      // chmodSync may be unsupported or a no-op on some filesystems
+    }
+    return generated;
+  } catch (err) {
+    const nodeErr = err as NodeJS.ErrnoException;
+    if (nodeErr.code === "EEXIST") {
+      const existing = fs.readFileSync(keyFile, "utf8").trim();
+      if (existing.length >= minLength) {
+        return existing;
+      }
+      throw new Error(
+        `Existing master key file at ${keyFile} is shorter than minimum length (${minLength}). Refusing to overwrite existing key file.`,
+      );
+    }
+    throw err;
+  }
 }

@@ -150,4 +150,109 @@ describe('Credentials Domain & Pure Web Crypto Storage Adapters', () => {
     await sessionStore.clearSessionState('user-abc');
     expect(await sessionStore.loadSessionState('user-abc')).toBeNull();
   });
+
+  it('serializes concurrent partial credential saves without lost read-modify-write updates', async () => {
+    const storage = new InMemoryVaultStorage('concurrent-secret');
+    await Promise.all([
+      saveEncryptedCredentials({ personCode: '10123456' }, storage),
+      saveEncryptedCredentials({ password: 'ConcurrentPassword!' }, storage),
+      saveEncryptedCredentials({ totpSecret: 'JBSWY3DPEHPK3PXP' }, storage),
+      saveEncryptedCredentials({ polimiEmail: 'mario.rossi@mail.polimi.it' }, storage)
+    ]);
+
+    const loaded = await loadEncryptedCredentials(storage);
+    expect(loaded).not.toBeNull();
+    expect(loaded?.personCode).toBe('10123456');
+    expect(loaded?.password).toBe('ConcurrentPassword!');
+    expect(loaded?.totpSecret).toBe('JBSWY3DPEHPK3PXP');
+    expect(loaded?.polimiEmail).toBe('mario.rossi@mail.polimi.it');
+  });
+
+  it('refuses to overwrite corrupt or undecryptable vault envelopes and redacts diagnostic warnings', async () => {
+    const storage = new InMemoryVaultStorage('right-secret');
+    await saveEncryptedCredentials(
+      {
+        personCode: '10998877',
+        password: 'ProtectedPassword!'
+      },
+      storage
+    );
+
+    const warnings: string[] = [];
+    const logger = {
+      debug: () => {},
+      info: () => {},
+      warn: (msg: string) => {
+        warnings.push(msg);
+      },
+      error: () => {}
+    };
+
+    // Wrong key cannot overwrite existing credentials silently
+    await expect(
+      saveEncryptedCredentials(
+        { personCode: '10000001' },
+        storage,
+        { secretMaterial: 'wrong-secret', logger }
+      )
+    ).rejects.toThrow(/Refusing to overwrite existing encrypted vault/i);
+    expect(warnings.length).toBeGreaterThan(0);
+
+    // Corrupted payload also refuses silent overwrite
+    await storage.set({ [VAULT_STORAGE_KEY]: { version: 1, iv: 'bad' } });
+    await expect(saveEncryptedCredentials({ personCode: '10000001' }, storage)).rejects.toThrow(
+      /Refusing to overwrite existing encrypted vault/i
+    );
+  });
+
+  it('aligns InMemorySessionStateStore and EncryptedCredentialVault key derivation on shared factory', async () => {
+    const factory = new InMemoryUserVaultStorageFactory('shared-master-secret');
+    const vault = new EncryptedCredentialVault({ userFactory: factory });
+    const sessionStore = new InMemorySessionStateStore<{ cookie: string }>(factory);
+
+    await vault.saveSessionState({ cookie: 'from-vault' }, 'alice');
+    expect(await sessionStore.loadSessionState('alice')).toEqual({ cookie: 'from-vault' });
+
+    await sessionStore.saveSessionState('bob', { cookie: 'from-store' });
+    expect(await vault.loadSessionState('bob')).toEqual({ cookie: 'from-store' });
+  });
+
+  it('refuses default secret fallback when requireSecretMaterial is enabled', async () => {
+    const emptySecretStorage = new InMemoryVaultStorage();
+    await expect(
+      saveEncryptedCredentials(
+        { personCode: '10123456' },
+        emptySecretStorage,
+        { requireSecretMaterial: true }
+      )
+    ).rejects.toThrow(/Refusing to fall back to the default local secret/i);
+
+    await expect(
+      loadEncryptedCredentials(emptySecretStorage, { requireSecretMaterial: true })
+    ).rejects.toThrow(/Refusing to fall back to the default local secret/i);
+
+    const vault = new EncryptedCredentialVault({
+      storage: emptySecretStorage,
+      cryptoOptions: { requireSecretMaterial: true }
+    });
+    await expect(vault.saveSessionState({ ok: true })).rejects.toThrow(
+      /Refusing to fall back to the default local secret/i
+    );
+    await expect(vault.loadSessionState()).rejects.toThrow(
+      /Refusing to fall back to the default local secret/i
+    );
+
+    // Explicit non-empty secret satisfies requireSecretMaterial even with blank override ignored
+    const keyHolder = new InMemoryVaultStorage('real-secret');
+    await saveEncryptedCredentials(
+      { personCode: '10123456' },
+      keyHolder,
+      { secretMaterial: '   ', requireSecretMaterial: true }
+    );
+    const loaded = await loadEncryptedCredentials(keyHolder, {
+      secretMaterial: '',
+      requireSecretMaterial: true
+    });
+    expect(loaded?.personCode).toBe('10123456');
+  });
 });

@@ -101,4 +101,74 @@ describe("@polisdk/telegram-auth", () => {
     expect(done?.status).toBe("completed");
     expect(wizard.getSession(111)).toBeNull();
   });
+
+  it("calls next() when ctx.from is missing, skips Markdown on custom unauthorizedReplyText, and runs onUserAuthenticated without userRepository", async () => {
+    const callbacks: Array<{ userId?: unknown }> = [];
+    const replies: Array<{ text: string; extra?: unknown }> = [];
+    let nextCalls = 0;
+
+    const middleware = createTelegramAuthMiddleware({
+      allowedUserIds: [111],
+      unauthorizedReplyText: (id) => `Custom_${id}_unauthenticated*raw`,
+      onUserAuthenticated: async (_ctx, user) => {
+        callbacks.push({ userId: user?.userId });
+      },
+    });
+
+    // 1. Missing ctx.from passes through to next()
+    await middleware(
+      {
+        reply: async (text, extra) => {
+          replies.push({ text, extra });
+        },
+      },
+      async () => {
+        nextCalls += 1;
+      },
+    );
+    expect(nextCalls).toBe(1);
+    expect(replies).toHaveLength(0);
+
+    // 2. Custom unauthorizedReplyText is sent without parse_mode: Markdown
+    await middleware(
+      {
+        from: { id: 999 },
+        chat: { id: 999, type: "private" },
+        reply: async (text, extra) => {
+          replies.push({ text, extra });
+        },
+      },
+      async () => {
+        nextCalls += 1;
+      },
+    );
+    expect(nextCalls).toBe(1);
+    expect(replies[0]).toEqual({
+      text: "Custom_999_unauthenticated*raw",
+      extra: undefined,
+    });
+
+    // 3. Authorized user invokes onUserAuthenticated even without userRepository
+    await middleware(
+      {
+        from: { id: 111 },
+        chat: { id: 111, type: "private" },
+        reply: async () => {},
+      },
+      async () => {
+        nextCalls += 1;
+      },
+    );
+    expect(nextCalls).toBe(2);
+    expect(callbacks).toEqual([{ userId: undefined }]);
+  });
+
+  it("preserves promptMessageId when skipTotpStep is rejected on an earlier wizard step", () => {
+    const wizard = new TelegramCredentialWizard();
+    wizard.startSession(555, 777);
+
+    const earlySkip = wizard.skipTotpStep(555);
+    expect(earlySkip?.status).toBe("validation_error");
+    expect(wizard.getSession(555)?.promptMessageId).toBe(777);
+  });
 });

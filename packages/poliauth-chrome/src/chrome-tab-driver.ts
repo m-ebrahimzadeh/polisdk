@@ -6,6 +6,7 @@
 
 import {
   DomAuthPageDriver,
+  POLIMI_LOGIN_FLOW_SPEC,
   createRedactingLogger,
   inspectFederatedSsoPageBySpec,
   redactSensitiveErrorText,
@@ -86,7 +87,14 @@ function isChromeTabsLike(value: unknown): value is ChromeTabsLike {
 
 function isTransientTabError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /execution context was destroyed|most likely because of a navigation|receiving end does not exist|message port closed|frame was detached|cannot access|navigation/i.test(
+  if (
+    /no tab with id|tab was closed|target closed|page has been closed|browser has been closed|context has been closed|has been closed/i.test(
+      msg,
+    )
+  ) {
+    return false;
+  }
+  return /execution context was destroyed|most likely because of a navigation|cannot find context|frame was detached|receiving end does not exist|receiving end returned empty response|message port closed|cannot access contents of (?:the )?page|navigating|interrupted by.*navigation|navigation in progress/i.test(
     msg,
   );
 }
@@ -145,10 +153,16 @@ export class ChromeExtensionTabDriver implements FederatedAuthPageDriverPort {
     const maxAttempts = Math.max(1, this.maxTransientRetries + 1);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        return await this.tabs.sendMessage<PoliAuthTabMessage, TResponse>(
-          this.tabId,
-          message,
-        );
+        const response = await this.tabs.sendMessage<
+          PoliAuthTabMessage,
+          TResponse | undefined
+        >(this.tabId, message);
+        if (response === undefined || response === null) {
+          throw new Error(
+            `Receiving end returned empty response for ${message.type} (content script not ready or frame unloading).`,
+          );
+        }
+        return response;
       } catch (err) {
         const redacted = redactSensitiveErrorText(err);
         if (!isTransientTabError(err)) {
@@ -208,9 +222,29 @@ export class ChromeExtensionTabDriver implements FederatedAuthPageDriverPort {
   }
 
   async recoverSessionPage(): Promise<SessionRecoveryResult> {
-    return this.sendMessageWithRetry<SessionRecoveryResult>({
-      type: "POLIAUTH_RECOVER_SESSION",
-    });
+    try {
+      const recovery = await this.sendMessageWithRetry<SessionRecoveryResult>({
+        type: "POLIAUTH_RECOVER_SESSION",
+      });
+      if (!recovery.ok) {
+        const targetUrl =
+          recovery.navigatedTo || POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
+        await this.goto(targetUrl);
+        return { ok: false, navigatedTo: targetUrl };
+      }
+      await this.waitForNavigation(1800);
+      return recovery;
+    } catch (err) {
+      if (!isTransientTabError(err)) {
+        throw err;
+      }
+      this.logger?.warn(
+        `Chrome recoverSessionPage interrupted by tab navigation; falling back to serviceEntryUrl: ${redactSensitiveErrorText(err)}`,
+      );
+      const fallbackUrl = POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
+      await this.goto(fallbackUrl);
+      return { ok: false, navigatedTo: fallbackUrl };
+    }
   }
 
   async submitCredentials(
@@ -343,5 +377,41 @@ export function createPoliAuthContentScriptHandler(
       default:
         return undefined;
     }
+  };
+}
+
+export type ChromeRuntimeMessageListener = (
+  message: unknown,
+  sender: unknown,
+  sendResponse: (response?: unknown) => void,
+) => boolean;
+
+/**
+ * Wraps `createPoliAuthContentScriptHandler` into a standard Chrome MV3
+ * `chrome.runtime.onMessage` listener (`(message, sender, sendResponse) => boolean`)
+ * that returns `true` only for `POLIAUTH_*` messages and resolves asynchronously via `sendResponse`.
+ */
+export function createPoliAuthChromeRuntimeMessageListener(
+  domDriver: DomAuthPageDriver,
+): ChromeRuntimeMessageListener {
+  const handler = createPoliAuthContentScriptHandler(domDriver);
+  return (message, _sender, sendResponse) => {
+    const msg = message as Partial<PoliAuthTabMessage> | null | undefined;
+    if (!msg || typeof msg.type !== "string" || !msg.type.startsWith("POLIAUTH_")) {
+      return false;
+    }
+
+    void handler(msg as PoliAuthTabMessage)
+      .then((result) => {
+        sendResponse(result);
+      })
+      .catch((err) => {
+        sendResponse({
+          ok: false,
+          error: redactSensitiveErrorText(err),
+        });
+      });
+
+    return true;
   };
 }

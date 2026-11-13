@@ -4,6 +4,8 @@
  */
 
 import {
+  isValidPersonCode,
+  isValidPolimiEmail,
   maskPersonCode,
   maskPolimiEmail
 } from '../domain/credentials.js';
@@ -86,6 +88,25 @@ export class CredentialSetupWizard {
     const session = this.sessions.get(key);
     if (!session) return null;
 
+    if (session.step === 'password') {
+      if (rawInput.length === 0) {
+        return {
+          status: 'validation_error',
+          step: 'password',
+          errorMessage: 'Password cannot be empty.',
+          session
+        };
+      }
+      session.password = rawInput;
+      session.step = 'email';
+      return {
+        status: 'next_step',
+        step: 'email',
+        session,
+        maskedPersonCode: maskPersonCode(session.personCode)
+      };
+    }
+
     const text = rawInput.trim();
     if (!text) {
       return {
@@ -97,6 +118,14 @@ export class CredentialSetupWizard {
     }
 
     if (session.step === 'person_code') {
+      if (!isValidPersonCode(text)) {
+        return {
+          status: 'validation_error',
+          step: 'person_code',
+          errorMessage: 'Invalid PoliMi Person Code. Expected 6 to 10 digits.',
+          session
+        };
+      }
       session.personCode = text;
       session.step = 'password';
       return {
@@ -107,18 +136,15 @@ export class CredentialSetupWizard {
       };
     }
 
-    if (session.step === 'password') {
-      session.password = rawInput.trim();
-      session.step = 'email';
-      return {
-        status: 'next_step',
-        step: 'email',
-        session,
-        maskedPersonCode: maskPersonCode(session.personCode)
-      };
-    }
-
     if (session.step === 'email') {
+      if (!isValidPolimiEmail(text)) {
+        return {
+          status: 'validation_error',
+          step: 'email',
+          errorMessage: 'Invalid PoliMi email address. Expected @mail.polimi.it or @polimi.it.',
+          session
+        };
+      }
       session.polimiEmail = text;
       session.step = 'totp_secret';
       return {
@@ -171,6 +197,15 @@ export class CredentialSetupWizard {
     const key = normalizeIdentityId(userId);
     const session = this.sessions.get(key);
     if (!session) return null;
+
+    if (session.step !== 'totp_secret') {
+      return {
+        status: 'validation_error',
+        step: session.step,
+        errorMessage: 'Cannot skip TOTP step before completing earlier onboarding steps.',
+        session
+      };
+    }
 
     this.sessions.delete(key);
     return {

@@ -5,7 +5,7 @@
 This document presents the final architecture audit, verification matrix, and quality scorecard for the **PoliSDK** ecosystem across its five modular TypeScript packages:
 - **`@polisdk/poliauth`** (Pure Domain, Application Use Cases, Hexagonal Ports, Pure Web Crypto Vault, DOM Adapters)
 - **`@polisdk/poliauth-playwright`** (Playwright Automation Driver, Multi-Tenant Session Pool, Precompiled DOM Injection Bundle)
-- **`@polisdk/poliauth-chrome`** (Chrome Extension MV3 Local Vault Storage, Tab Message Driver, Content Script Bridge)
+- **`@polisdk/poliauth-chrome`** (Chrome Extension MV3 Local Vault Storage, Tab Message Driver, Content Script & Runtime Listener Bridge)
 - **`@polisdk/storage-sqlite`** (SQLite Multi-Tenant User Identity Database, Encrypted Vault KV, Master Key Resolver)
 - **`@polisdk/telegram-auth`** (Framework-Agnostic Telegram Auth Middleware, Interactive Credential Wizard, Sensitive Message Guard)
 
@@ -52,10 +52,10 @@ flowchart TD
 
 | Package | Runtime Dependencies (`dependencies`) | Peer Dependencies (`peerDependencies`) | Dev Dependencies (`devDependencies`) | Runtime Environment |
 | :--- | :--- | :--- | :--- | :--- |
-| **`@polisdk/poliauth`** | **None (`{}`)** | None | `typescript`, `vitest` | Node.js 20+, Deno, Bun, Cloudflare Workers, Modern Browsers |
-| **`@polisdk/poliauth-playwright`** | `@polisdk/poliauth` | `playwright: ">=1.40.0"` (optional) | `typescript`, `vitest` | Node.js 20+ |
+| **`@polisdk/poliauth`** | **None (`{}`)** | None | Workspace `typescript`, `vitest` | Node.js 20+, Deno, Bun, Cloudflare Workers, Modern Browsers |
+| **`@polisdk/poliauth-playwright`** | `@polisdk/poliauth` | `playwright: ">=1.40.0"` (optional) | `@types/node`, `esbuild`, `typescript`, `vitest` | Node.js 20+ |
 | **`@polisdk/poliauth-chrome`** | `@polisdk/poliauth` | None | `@types/chrome`, `typescript`, `vitest` | Chrome MV3 (Background, Popup, Content Scripts) |
-| **`@polisdk/storage-sqlite`** | `@polisdk/poliauth` | `better-sqlite3: ">=9.0.0"` (optional) | `@types/better-sqlite3`, `better-sqlite3`, `typescript`, `vitest` | Node.js 20+ |
+| **`@polisdk/storage-sqlite`** | `@polisdk/poliauth` | `better-sqlite3: ">=9.0.0"` (optional) | `@types/better-sqlite3`, `@types/node`, `better-sqlite3`, `typescript`, `vitest` | Node.js 20+ |
 | **`@polisdk/telegram-auth`** | `@polisdk/poliauth` | None | `typescript`, `vitest` | Any Node.js/TypeScript bot runtime (`grammY`, `Telegraf`, etc.) |
 
 ---
@@ -64,9 +64,9 @@ flowchart TD
 
 | Package | Core Responsibilities | Public Entry Points & Subpaths | Forbidden Dependencies |
 | :--- | :--- | :--- | :--- |
-| **`@polisdk/poliauth`** | Enterprise domain entities, credential validation/masking rules, RFC 6238 TOTP derivation, PoliMi SSO specifications, application orchestrators (`PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService`), hexagonal ports, Web Crypto AES-256-GCM vault, pure DOM adapters, generic auth middleware, secret-redacting logging. | `.`, `./domain`, `./application`, `./interfaces`, `./adapters`, `./storage`, `./middleware` | `better-sqlite3`, `playwright`, `esbuild` (runtime), `node:fs`, `node:path`, `node:url`, `node:crypto`, `Buffer`, `chrome.*`, Telegram bot libraries, downstream scraping logic. |
+| **`@polisdk/poliauth`** | Enterprise domain entities, credential validation/masking rules, secret redaction primitives, RFC 6238 TOTP derivation, PoliMi SSO specifications, application orchestrators (`PoliAuthOrchestrator`, `OtpChallengeCoordinator`, `CredentialSetupWizard`, `AuthorizationService`, `createRedactingLogger`), hexagonal ports, Web Crypto AES-256-GCM vault, pure DOM adapters, generic auth middleware. | `.`, `./domain`, `./application`, `./interfaces`, `./adapters`, `./storage`, `./middleware` | `better-sqlite3`, `playwright`, `esbuild` (runtime), `node:fs`, `node:path`, `node:url`, `node:crypto`, `Buffer`, `chrome.*`, Telegram bot libraries, downstream scraping logic. |
 | **`@polisdk/poliauth-playwright`** | `PlaywrightAuthPageDriver`, `PlaywrightBrowserSessionPool` (reference-counted user locks, LRU capacity eviction, idle TTL cleanup, encrypted `storageState` persistence), precompiled DOM adapter injection bundle. | `.`, `./browser-bundle` | `better-sqlite3`, `chrome.*`, Telegram bot libraries. |
-| **`@polisdk/poliauth-chrome`** | `ChromeLocalVaultStorage` (`chrome.storage.local`), `ChromeExtensionTabDriver` (`chrome.tabs.sendMessage`), and `createPoliAuthContentScriptHandler`. | `.` | `better-sqlite3`, `playwright`, `node:*`, Telegram bot libraries. |
+| **`@polisdk/poliauth-chrome`** | `ChromeLocalVaultStorage` (`chrome.storage.local`), `ChromeExtensionTabDriver` (`chrome.tabs.sendMessage`), `createPoliAuthContentScriptHandler`, and `createPoliAuthChromeRuntimeMessageListener`. | `.` | `better-sqlite3`, `playwright`, `node:*`, Telegram bot libraries. |
 | **`@polisdk/storage-sqlite`** | Multi-user SQLite identity repository (`PoliAuthSqliteDatabase`), encrypted per-user vault backend (`SqliteVaultStorageBackend`), encrypted session state store (`SqliteSessionStateStore`), and master key file resolver (`resolveMasterEncryptionKey`). | `.` | `playwright`, `chrome.*`, Telegram bot libraries, legacy `polirecord_*` schema naming. |
 | **`@polisdk/telegram-auth`** | `createTelegramAuthMiddleware`, `deleteSensitiveTelegramMessage`, `TelegramCredentialWizard`, and `TELEGRAM_BOT_TOKEN_REDACTION_RULE`. | `.` | `better-sqlite3`, `playwright`, `chrome.*`. |
 
@@ -86,9 +86,9 @@ flowchart TD
   end
 
   subgraph Layer3["Interface Adapters (@polisdk/poliauth)"]
-    DOM_A["adapters/ (DomAuthPageDriver, Polimi, Webex, Zoom)"]
+    DOM_A["adapters/ (DomAuthPageDriver, DomFederatedAuthPageDriver, Polimi, Webex, Federated)"]
     VAULT_A["storage/ (EncryptedCredentialVault, InMemoryStorage)"]
-    MW_A["middleware/ (createAuthMiddleware, RedactingLogger)"]
+    MW_A["middleware/ (createAuthMiddleware, re-exported redaction helpers)"]
   end
 
   subgraph Layer2["Application Business Rules (Use Cases)"]
@@ -96,13 +96,15 @@ flowchart TD
     OTP["OtpChallengeCoordinator"]
     WIZ["CredentialSetupWizard"]
     AUTHZ["AuthorizationService"]
+    REDACT_LOG["application/redacting-logger.ts (createRedactingLogger)"]
   end
 
   subgraph Layer1["Enterprise Business Rules (Pure Domain)"]
     ENT["domain/entities.ts (IdentityId, LoginCredentials, UserIdentity)"]
     TOTP["domain/totp.ts (RFC 6238 TOTP Service)"]
-    CREDS["domain/credentials.ts (Masking & Validation)"]
+    CREDS["domain/credentials.ts (Masking, Validation, Merge)"]
     SPEC["domain/login-flow-spec.ts (PoliMi IdP Flow Specification)"]
+    REDACT["domain/redaction.ts (RedactionRule, redactSecrets, redactSensitiveErrorText)"]
   end
 
   Layer4 --> Layer3
@@ -275,7 +277,7 @@ packages/
 │   ├── .                     # PlaywrightAuthPageDriver, PlaywrightBrowserSessionPool, bundle helpers
 │   └── ./browser-bundle      # Standalone browser IIFE script (dist/injected-auth-adapters.iife.js)
 ├── poliauth-chrome/
-│   └── .                     # ChromeLocalVaultStorage, ChromeExtensionTabDriver, createPoliAuthContentScriptHandler
+│   └── .                     # ChromeLocalVaultStorage, ChromeExtensionTabDriver, createPoliAuthContentScriptHandler, createPoliAuthChromeRuntimeMessageListener
 ├── storage-sqlite/
 │   └── .                     # PoliAuthSqliteDatabase, SqliteVaultStorageBackend, SqliteSessionStateStore, resolveMasterEncryptionKey
 └── telegram-auth/
@@ -327,7 +329,7 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 | :--- | :---: | :---: | :--- |
 | **Modularity** | `3/10` | **`10/10`** | Monolithic codebase decomposed into 5 cleanly bounded packages. `@polisdk/poliauth` has zero runtime dependencies and can run in any modern JS engine. |
 | **Reusability** | `2/10` | **`10/10`** | Pure domain models, TOTP algorithms, and DOM adapters can be embedded in browser extensions, desktop apps, servers, or CLI tools without dragging in SQLite or Playwright. |
-| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 50 automated tests pass across 10 test files. |
+| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 70 automated tests pass across 13 test files. |
 | **Extensibility** | `4/10` | **`10/10`** | Pluggable SPI for federated SAML providers (`FederatedSsoProviderAdapterPort`), declarative JSON specs, pluggable storage adapters (`VaultStoragePort`), and custom resource authorization policies. |
 | **Clean Architecture Compliance** | `2/10` | **`10/10`** | Strict inward dependency direction. Domain has zero external imports. Ports and adapters completely abstract all I/O, database, and browser mechanics. Authentication stops strictly at `'authenticated'`. |
 
@@ -338,5 +340,5 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 ```text
 ✅ Build:     npm run build     --> 5/5 packages compiled cleanly
 ✅ Typecheck: npm run typecheck --> 0 errors across entire workspace
-✅ Tests:     npm test          --> 10/10 test files passed, 50/50 tests passing
+✅ Tests:     npm test          --> 13/13 test files passed, 70/70 tests passing
 ```

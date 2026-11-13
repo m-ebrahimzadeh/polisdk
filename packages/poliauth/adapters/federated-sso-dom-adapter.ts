@@ -94,10 +94,16 @@ export function isFederatedIdentifierPromptPage(
   if (querySelectorSafe(doc, prompt.identifierInputSelector)) {
     return true;
   }
-  return (
-    hostnameMatches(loc.hostname, prompt.hostnames) ||
-    Boolean(prompt.pathnameSubstrings?.some((fragment) => loc.pathname.includes(fragment)))
-  );
+  const hasHostnames = prompt.hostnames.length > 0;
+  const hasPathnames = Boolean(prompt.pathnameSubstrings?.length);
+  if (!hasHostnames && !hasPathnames) {
+    return false;
+  }
+  const hostOk = !hasHostnames || hostnameMatches(loc.hostname, prompt.hostnames);
+  const pathOk =
+    !hasPathnames ||
+    Boolean(prompt.pathnameSubstrings?.some((fragment) => loc.pathname.includes(fragment)));
+  return hostOk && pathOk;
 }
 
 /**
@@ -199,20 +205,6 @@ export function inspectFederatedSsoPageBySpec(
   }
 
   if (
-    !isTransit &&
-    spec.authenticatedSelectors?.some((selector) => querySelectorSafe(doc, selector))
-  ) {
-    return {
-      providerId,
-      status: 'authenticated',
-      isIdentifierPrompt: false,
-      isLoginTrigger: false,
-      isSamlTransitPage: false,
-      url
-    };
-  }
-
-  if (
     spec.loginTrigger &&
     matchesLoginTriggerLocation(spec.loginTrigger, loc) &&
     querySelectorSafe(doc, spec.loginTrigger.triggerSelector)
@@ -225,6 +217,22 @@ export function inspectFederatedSsoPageBySpec(
       isSamlTransitPage: false,
       url,
       reason: `${spec.displayName} SSO login trigger detected`
+    };
+  }
+
+  if (
+    !isTransit &&
+    !isFederatedLoginTriggerPage(spec, doc, loc) &&
+    !isFederatedIdentifierPromptPage(spec, doc, loc) &&
+    spec.authenticatedSelectors?.some((selector) => querySelectorSafe(doc, selector))
+  ) {
+    return {
+      providerId,
+      status: 'authenticated',
+      isIdentifierPrompt: false,
+      isLoginTrigger: false,
+      isSamlTransitPage: false,
+      url
     };
   }
 

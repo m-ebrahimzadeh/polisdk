@@ -36,10 +36,15 @@ execSync('npx tsc -p tsconfig.json', {
   stdio: 'inherit'
 });
 
-// 4. Write standalone IIFE artifact into dist/
+// 4. Write standalone IIFE artifact and companion declaration into dist/
 fs.writeFileSync(
   path.join(distDir, 'injected-auth-adapters.iife.js'),
   iifeCode,
+  'utf8'
+);
+fs.writeFileSync(
+  path.join(distDir, 'injected-auth-adapters.iife.d.ts'),
+  `// Type declaration for side-effect IIFE bundle attaching window.__PoliAuthAdapters\nexport {};\n`,
   'utf8'
 );
 

@@ -6,6 +6,7 @@ import {
   type UserIdentityPatch
 } from '../domain/entities.js';
 import type {
+  VaultSecretMaterialPort,
   VaultStoragePort,
   UserVaultStorageFactoryPort,
   SessionStateStorePort,
@@ -21,7 +22,7 @@ import {
  * In-memory `VaultStoragePort` implementation suitable for unit tests,
  * ephemeral CLI sessions, or single-tenant in-memory execution.
  */
-export class InMemoryVaultStorage implements VaultStoragePort {
+export class InMemoryVaultStorage implements VaultStoragePort, VaultSecretMaterialPort {
   private readonly store = new Map<string, unknown>();
   private readonly secretMaterial?: string;
 
@@ -91,21 +92,32 @@ export class InMemoryUserVaultStorageFactory implements UserVaultStorageFactoryP
  */
 export class InMemorySessionStateStore<TState = unknown> implements SessionStateStorePort<TState> {
   private readonly factory: UserVaultStorageFactoryPort;
-  private readonly secretMaterial: string;
+  private readonly secretMaterial?: string;
 
   constructor(
     factory: UserVaultStorageFactoryPort = new InMemoryUserVaultStorageFactory(),
-    secretMaterial = 'poliauth-in-memory-session-secret-key-v1'
+    secretMaterial?: string
   ) {
     this.factory = factory;
     this.secretMaterial = secretMaterial;
+  }
+
+  private resolveSecret(storage: VaultStoragePort, userId: IdentityId): string {
+    if (this.secretMaterial !== undefined && this.secretMaterial.trim().length > 0) {
+      return `${this.secretMaterial}::${normalizeIdentityId(userId)}`;
+    }
+    const storageSecret = (storage as Partial<VaultSecretMaterialPort>).getSecretMaterial?.();
+    if (storageSecret !== undefined) {
+      return storageSecret;
+    }
+    return `poliauth-in-memory-session-secret-key-v1::${normalizeIdentityId(userId)}`;
   }
 
   async loadSessionState<T extends TState = TState>(userId: IdentityId): Promise<T | null> {
     const storage = this.factory.createForUser(userId);
     return loadEncryptedSessionState<T>(
       storage,
-      `${this.secretMaterial}::${normalizeIdentityId(userId)}`
+      this.resolveSecret(storage, userId)
     );
   }
 
@@ -114,7 +126,7 @@ export class InMemorySessionStateStore<TState = unknown> implements SessionState
     await saveEncryptedSessionState(
       storage,
       state,
-      `${this.secretMaterial}::${normalizeIdentityId(userId)}`
+      this.resolveSecret(storage, userId)
     );
   }
 
