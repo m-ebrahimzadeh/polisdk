@@ -1,9 +1,25 @@
 import { POLIMI_LOGIN_FLOW_SPEC } from '../domain/login-flow-spec.js';
-import type {
-  PolimiPageStage,
-  PolimiStageInspectionResult
+import {
+  classifyPolimiFailure,
+  isExpectedPolimiIdpHostname,
+  type PoliAuthDiagnosticErrorPayload,
+  type PoliAuthDomDiagnosticSnapshot,
+  type PolimiPageStage,
+  type PolimiStageInspectionResult
 } from '../domain/entities.js';
-import type { PageLocationSnapshot } from '../interfaces/browser-driver-port.js';
+import { redactSecrets } from '../domain/redaction.js';
+import type {
+  PageActionResult,
+  PageLocationSnapshot
+} from '../interfaces/browser-driver-port.js';
+
+export interface PolimiPageActionResult extends PageActionResult {
+  diagnostic?: PoliAuthDiagnosticErrorPayload;
+}
+
+export interface PolimiStageInspectionOptions {
+  httpStatus?: number;
+}
 
 function dispatchInputEvents(el: Element): void {
   const EventCtor = el.ownerDocument?.defaultView?.Event ?? Event;
@@ -15,6 +31,24 @@ function getPageUrl(loc: PageLocationSnapshot): string {
   return loc.href || `${loc.pathname}${loc.search ?? ''}`;
 }
 
+function getFallbackLocation(doc: Document): PageLocationSnapshot {
+  const docLoc = (doc as { location?: Location | null }).location;
+  if (docLoc) {
+    return {
+      hostname: docLoc.hostname || '',
+      pathname: docLoc.pathname || '',
+      search: docLoc.search || '',
+      href: docLoc.href || ''
+    };
+  }
+  return {
+    hostname: '',
+    pathname: '',
+    search: '',
+    href: ''
+  };
+}
+
 function isPolimiHostname(hostname: string): boolean {
   const lower = (hostname || '').toLowerCase();
   return lower === 'polimi.it' || lower.endsWith('.polimi.it');
@@ -22,14 +56,208 @@ function isPolimiHostname(hostname: string): boolean {
 
 function isPolimiIdpLocation(loc: PageLocationSnapshot): boolean {
   const lowerHost = (loc.hostname || '').toLowerCase();
+  if (isExpectedPolimiIdpHostname(lowerHost)) {
+    return true;
+  }
   const idpHost = POLIMI_LOGIN_FLOW_SPEC.entry.idpHostname.toLowerCase();
-  if (lowerHost === idpHost || lowerHost.endsWith(`.${idpHost}`)) {
+  if (lowerHost.endsWith(`.${idpHost}`)) {
     return true;
   }
   return (
     isPolimiHostname(lowerHost) &&
     (loc.pathname || '').includes(POLIMI_LOGIN_FLOW_SPEC.entry.idpPathnameSubstring)
   );
+}
+
+function isDomElementVisible(el: Element): boolean {
+  if (el.classList?.contains('jaf-visually-hidden')) {
+    return false;
+  }
+  let current: Element | null = el;
+  while (current) {
+    if (current.hasAttribute('hidden')) {
+      return false;
+    }
+    const htmlCurrent = current as HTMLElement;
+    if (
+      htmlCurrent.style &&
+      (htmlCurrent.style.display === 'none' || htmlCurrent.style.visibility === 'hidden')
+    ) {
+      return false;
+    }
+    const view = el.ownerDocument?.defaultView;
+    if (view && typeof view.getComputedStyle === 'function') {
+      const computed = view.getComputedStyle(current);
+      if (computed.display === 'none' || computed.visibility === 'hidden') {
+        return false;
+      }
+      if (
+        computed.clip === 'rect(0px, 0px, 0px, 0px)' ||
+        (computed.position === 'absolute' &&
+          computed.width === '1px' &&
+          computed.height === '1px' &&
+          computed.overflow === 'hidden')
+      ) {
+        return false;
+      }
+    }
+    current = current.parentElement;
+  }
+  return true;
+}
+
+function findPreferredButton(
+  doc: Document,
+  primarySelectorList: string,
+  fallbackSelectorList?: string
+): HTMLElement | null {
+  const pickOrdered = (selectorList: string, requireVisible: boolean): HTMLElement | null => {
+    if (!selectorList) return null;
+    const parts = selectorList
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const part of parts) {
+      let matches: HTMLElement[] = [];
+      try {
+        matches = Array.from(doc.querySelectorAll<HTMLElement>(part));
+      } catch {
+        matches = [];
+      }
+      for (const candidate of matches) {
+        const disabled =
+          (candidate as HTMLButtonElement).disabled || candidate.hasAttribute('disabled');
+        if (disabled) continue;
+        if (!requireVisible || isDomElementVisible(candidate)) {
+          return candidate;
+        }
+      }
+    }
+    return null;
+  };
+
+  return (
+    pickOrdered(primarySelectorList, true) ??
+    pickOrdered(fallbackSelectorList ?? '', true) ??
+    pickOrdered(primarySelectorList, false) ??
+    pickOrdered(fallbackSelectorList ?? '', false)
+  );
+}
+
+function hasMaintenanceBannerInDoc(doc: Document): boolean {
+  const titleText = (doc.title || '').toLowerCase();
+  const bodyText = (doc.body?.textContent ?? '').toLowerCase();
+  if (
+    POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.textPatterns.some(
+      (pattern) =>
+        bodyText.includes(pattern.toLowerCase()) ||
+        titleText.includes(pattern.toLowerCase())
+    )
+  ) {
+    return true;
+  }
+
+  for (const bannerSel of POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.bannerSelectors) {
+    if (bannerSel === '.maintenance-banner' && doc.querySelector(bannerSel)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractErrorAlertText(doc: Document): string | undefined {
+  const candidates = [
+    POLIMI_LOGIN_FLOW_SPEC.credentialsPage.errorAlertSelector,
+    POLIMI_LOGIN_FLOW_SPEC.otpPage.errorAlertSelector,
+    POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.dangerAlert
+  ];
+  for (const sel of candidates) {
+    const text = doc.querySelector(sel)?.textContent?.trim();
+    if (text) {
+      return text;
+    }
+  }
+  return undefined;
+}
+
+function hasSessionExpiredMarkers(doc: Document, loc: PageLocationSnapshot): boolean {
+  const onPolimiIdp = isPolimiIdpLocation(loc);
+  if (!onPolimiIdp) {
+    return false;
+  }
+  const bodyText = (doc.body?.textContent ?? '').toLowerCase();
+  const continueLink = doc.querySelector<HTMLAnchorElement>(
+    POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.continueToPortalLink
+  );
+  return (
+    loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker) ||
+    POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredTextMarkers.some((marker) =>
+      bodyText.includes(marker)
+    ) ||
+    Boolean(continueLink)
+  );
+}
+
+/**
+ * Captures a sanitized structural DOM snapshot suitable for deterministic failure
+ * classification (`PORTAL_OUTAGE_OR_NETWORK_ERROR` vs. `DOM_SELECTOR_DRIFT`).
+ */
+export function capturePolimiDomDiagnosticSnapshot(
+  doc: Document,
+  loc: PageLocationSnapshot,
+  httpStatus?: number
+): PoliAuthDomDiagnosticSnapshot {
+  const url = redactSecrets(getPageUrl(loc));
+  const pathname = redactSecrets(loc.pathname || '');
+  const rawError = extractErrorAlertText(doc);
+  const sanitizedError = rawError ? redactSecrets(rawError) : undefined;
+  const hasMaintenanceBanner = hasMaintenanceBannerInDoc(doc);
+  const bodyChildren = doc.body?.children?.length ?? 0;
+  const trimmedBodyText = (doc.body?.textContent ?? '').trim();
+  const hasEmptyBody = !doc.body || (bodyChildren === 0 && trimmedBodyText.length === 0);
+
+  const hasLoginInput = Boolean(
+    doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.credentialsPage.personCodeInputSelector)
+  );
+  const hasPasswordInput = Boolean(
+    doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.credentialsPage.passwordInputSelector)
+  );
+  const hasOtpInput = Boolean(
+    doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector) ??
+      doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackOtpInputSelector)
+  );
+  const hasSsoHandoffForm = Boolean(
+    doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.ssoHandoffPage.formSelector) ??
+      doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.ssoHandoffPage.checkCookieInputSelector)
+  );
+  const hasExpiredSessionMarker = hasSessionExpiredMarkers(doc, loc);
+
+  const hasAuthenticatedMarker =
+    isPolimiHostname(loc.hostname) &&
+    !hasMaintenanceBanner &&
+    !hasEmptyBody &&
+    !hasLoginInput &&
+    !hasPasswordInput &&
+    !hasOtpInput &&
+    POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.authenticatedDomSelectors.some((selector) =>
+      Boolean(doc.querySelector(selector))
+    );
+
+  return {
+    url,
+    pathname,
+    ...(httpStatus !== undefined ? { httpStatus } : {}),
+    hasEmptyBody,
+    hasLoginInput,
+    hasPasswordInput,
+    hasOtpInput,
+    hasSsoHandoffForm,
+    hasExpiredSessionMarker,
+    hasAuthenticatedMarker,
+    hasErrorBanner: Boolean(sanitizedError),
+    hasMaintenanceBanner,
+    ...(sanitizedError ? { errorMessage: sanitizedError } : {})
+  };
 }
 
 /**
@@ -42,7 +270,9 @@ export function isPolimiLoginPage(doc: Document, loc: PageLocationSnapshot): boo
     return true;
   }
 
-  const otpInput = doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector);
+  const otpInput =
+    doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector) ??
+    doc.querySelector(POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackOtpInputSelector);
   if (otpInput) {
     return true;
   }
@@ -73,10 +303,20 @@ export function isPolimiAuthenticatedSessionPage(
     return false;
   }
 
+  if (hasMaintenanceBannerInDoc(doc)) {
+    return false;
+  }
+
   for (const selector of POLIMI_LOGIN_FLOW_SPEC.authenticatedSession.authenticatedDomSelectors) {
     if (doc.querySelector(selector)) {
       return true;
     }
+  }
+
+  const bodyChildren = doc.body?.children?.length ?? 0;
+  const trimmedBodyText = (doc.body?.textContent ?? '').trim();
+  if (!doc.body || (bodyChildren === 0 && trimmedBodyText.length === 0)) {
+    return false;
   }
 
   const lowerHost = (loc.hostname || '').toLowerCase();
@@ -100,35 +340,57 @@ export function isPolimiAuthenticatedSessionPage(
  * - `'otp'`: 2FA OTP input page (`IdentificazioneUnica.do` / `IdentificazioneDFA.do`)
  * - `'sso_handoff'`: Intermediate SSO cookie handoff (`AunicaLogin.do?evn_checkCookieSSO=evento`)
  * - `'credentials'`: Person Code + Password login form (`aunicalogin.jsp`)
- * - `'unknown'`: Unrecognized or intermediate page
+ * - `'unknown'`: Unrecognized, maintenance, or intermediate page
  */
 export function inspectPolimiPageStage(
   doc: Document,
-  loc: PageLocationSnapshot
+  loc: PageLocationSnapshot,
+  options?: PolimiStageInspectionOptions
 ): PolimiStageInspectionResult {
   const url = getPageUrl(loc);
   const title = doc.title || '';
-  const dangerError =
-    doc
-      .querySelector(POLIMI_LOGIN_FLOW_SPEC.credentialsPage.errorAlertSelector)
-      ?.textContent?.trim() || undefined;
+  const httpStatus = options?.httpStatus;
+  const dangerError = extractErrorAlertText(doc);
+
+  const buildUnknownResult = (selectorOrEndpoint: string): PolimiStageInspectionResult => {
+    const sanitizedUrl = redactSecrets(url);
+    const diagnosticSnapshot = capturePolimiDomDiagnosticSnapshot(doc, loc, httpStatus);
+    const diagnosticError = classifyPolimiFailure({
+      component: '@polisdk/poliauth/adapters/polimi-dom-adapter',
+      operation: 'inspectPolimiPageStage',
+      stage: 'unknown',
+      url: sanitizedUrl,
+      pathname: loc.pathname,
+      httpStatus,
+      selectorOrEndpoint,
+      diagnosticSnapshot
+    });
+    return {
+      stage: 'unknown',
+      url: sanitizedUrl,
+      title,
+      ...(dangerError ? { errorMessage: redactSecrets(dangerError) } : {}),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      diagnosticSnapshot,
+      diagnosticError
+    };
+  };
+
+  // 0. Explicit HTTP 5xx server outage -> classify immediately instead of misreading page state
+  if (
+    httpStatus !== undefined &&
+    ((
+      POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators.httpStatusCodes as readonly number[]
+    ).includes(httpStatus) ||
+      httpStatus >= 500)
+  ) {
+    return buildUnknownResult(
+      `HTTP ${String(httpStatus)} (${POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl})`
+    );
+  }
 
   // 1. Session Expired / Terminated Security Violation page (scoped to PoliMi IdP)
-  const onPolimiIdp = isPolimiIdpLocation(loc);
-  const bodyText = (doc.body?.textContent ?? '').toLowerCase();
-  const continueLink = onPolimiIdp
-    ? doc.querySelector<HTMLAnchorElement>(
-        POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredSelectors.continueToPortalLink
-      )
-    : null;
-  if (
-    onPolimiIdp &&
-    (loc.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker) ||
-      POLIMI_LOGIN_FLOW_SPEC.entry.sessionExpiredTextMarkers.some((marker) =>
-        bodyText.includes(marker)
-      ) ||
-      Boolean(continueLink))
-  ) {
+  if (hasSessionExpiredMarkers(doc, loc)) {
     return {
       stage: 'session_expired',
       url,
@@ -184,7 +446,7 @@ export function inspectPolimiPageStage(
     };
   }
 
-  // 5. Authenticated PoliMi Session
+  // 5. Authenticated PoliMi Session (guard against empty/maintenance pages on servizionline.polimi.it)
   if (isPolimiAuthenticatedSessionPage(doc, loc)) {
     return {
       stage: 'authenticated',
@@ -193,11 +455,9 @@ export function inspectPolimiPageStage(
     };
   }
 
-  return {
-    stage: 'unknown',
-    url,
-    title
-  };
+  return buildUnknownResult(
+    `${POLIMI_LOGIN_FLOW_SPEC.credentialsPage.personCodeInputSelector} | ${POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector}`
+  );
 }
 
 /**
@@ -237,8 +497,10 @@ export function recoverPolimiSessionPage(doc: Document): {
  */
 export function submitPolimiCredentials(
   doc: Document,
-  credentials: { personCode: string; password: string; stayConnected?: boolean }
-): { ok: boolean; error?: string } {
+  credentials: { personCode: string; password: string; stayConnected?: boolean },
+  loc?: PageLocationSnapshot
+): PolimiPageActionResult {
+  const resolvedLoc = loc ?? getFallbackLocation(doc);
   const loginInput = doc.querySelector<HTMLInputElement>(
     POLIMI_LOGIN_FLOW_SPEC.credentialsPage.personCodeInputSelector
   );
@@ -247,9 +509,21 @@ export function submitPolimiCredentials(
   );
 
   if (!loginInput || !passwordInput) {
+    const diagnosticSnapshot = capturePolimiDomDiagnosticSnapshot(doc, resolvedLoc);
+    const diagnostic = classifyPolimiFailure({
+      component: '@polisdk/poliauth/adapters/polimi-dom-adapter',
+      operation: 'submitCredentials',
+      stage: 'credentials',
+      url: getPageUrl(resolvedLoc),
+      pathname: resolvedLoc.pathname,
+      selectorOrEndpoint: `${POLIMI_LOGIN_FLOW_SPEC.credentialsPage.personCodeInputSelector} | ${POLIMI_LOGIN_FLOW_SPEC.credentialsPage.passwordInputSelector}`,
+      error: 'PoliMi #login or #password input fields not found on page.',
+      diagnosticSnapshot
+    });
     return {
       ok: false,
-      error: 'PoliMi #login or #password input fields not found on page.'
+      error: diagnostic.message,
+      diagnostic
     };
   }
 
@@ -271,11 +545,11 @@ export function submitPolimiCredentials(
     }
   }
 
-  const visibleSubmitBtn =
-    doc.querySelector<HTMLElement>(POLIMI_LOGIN_FLOW_SPEC.credentialsPage.submitButtonSelector) ??
-    doc.querySelector<HTMLElement>(
-      POLIMI_LOGIN_FLOW_SPEC.credentialsPage.fallbackSubmitButtonSelector
-    );
+  const visibleSubmitBtn = findPreferredButton(
+    doc,
+    POLIMI_LOGIN_FLOW_SPEC.credentialsPage.submitButtonSelector,
+    POLIMI_LOGIN_FLOW_SPEC.credentialsPage.fallbackSubmitButtonSelector
+  );
 
   if (visibleSubmitBtn) {
     visibleSubmitBtn.click();
@@ -288,29 +562,57 @@ export function submitPolimiCredentials(
     return { ok: true };
   }
 
+  const diagnosticSnapshot = capturePolimiDomDiagnosticSnapshot(doc, resolvedLoc);
+  const diagnostic = classifyPolimiFailure({
+    component: '@polisdk/poliauth/adapters/polimi-dom-adapter',
+    operation: 'submitCredentials',
+    stage: 'credentials',
+    url: getPageUrl(resolvedLoc),
+    pathname: resolvedLoc.pathname,
+    selectorOrEndpoint: POLIMI_LOGIN_FLOW_SPEC.credentialsPage.submitButtonSelector,
+    error: 'Could not locate visible submit button or parent form for credentials.',
+    diagnosticSnapshot
+  });
+
   return {
     ok: false,
-    error: 'Could not locate visible submit button or parent form for credentials.'
+    error: diagnostic.message,
+    diagnostic
   };
 }
 
 /**
- * Populates the 2FA OTP input on the PoliMi 2FA page and clicks `#submit-dissms[name="evn_continua"]`
- * (strictly avoiding the hidden `.jaf-visually-hidden` duplicate button).
+ * Populates the 2FA OTP input on the PoliMi 2FA page and prioritizes the primary
+ * `button[name="evn_continua"]:not(#submit-dissms):not(.jaf-visually-hidden)` control,
+ * falling back cleanly to `#submit-dissms` when it is the sole visible submit button.
  */
 export function submitPolimiOtp(
   doc: Document,
-  otpInputOrParams: string | { otp: string }
-): { ok: boolean; error?: string } {
+  otpInputOrParams: string | { otp: string },
+  loc?: PageLocationSnapshot
+): PolimiPageActionResult {
+  const resolvedLoc = loc ?? getFallbackLocation(doc);
   const rawOtp = typeof otpInputOrParams === 'string' ? otpInputOrParams : otpInputOrParams.otp;
   const otpField =
     doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector) ??
     doc.querySelector<HTMLInputElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackOtpInputSelector);
 
   if (!otpField) {
+    const diagnosticSnapshot = capturePolimiDomDiagnosticSnapshot(doc, resolvedLoc);
+    const diagnostic = classifyPolimiFailure({
+      component: '@polisdk/poliauth/adapters/polimi-dom-adapter',
+      operation: 'submitOtp',
+      stage: 'otp',
+      url: getPageUrl(resolvedLoc),
+      pathname: resolvedLoc.pathname,
+      selectorOrEndpoint: POLIMI_LOGIN_FLOW_SPEC.otpPage.otpInputSelector,
+      error: 'OTP input field not found on page.',
+      diagnosticSnapshot
+    });
     return {
       ok: false,
-      error: 'OTP input field not found on page.'
+      error: diagnostic.message,
+      diagnostic
     };
   }
 
@@ -319,9 +621,11 @@ export function submitPolimiOtp(
   otpField.value = cleanOtp;
   dispatchInputEvents(otpField);
 
-  const submitBtn =
-    doc.querySelector<HTMLElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.submitButtonSelector) ??
-    doc.querySelector<HTMLElement>(POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackSubmitButtonSelector);
+  const submitBtn = findPreferredButton(
+    doc,
+    POLIMI_LOGIN_FLOW_SPEC.otpPage.submitButtonSelector,
+    POLIMI_LOGIN_FLOW_SPEC.otpPage.fallbackSubmitButtonSelector
+  );
 
   if (submitBtn) {
     submitBtn.click();
@@ -334,10 +638,24 @@ export function submitPolimiOtp(
     return { ok: true };
   }
 
+  const diagnosticSnapshot = capturePolimiDomDiagnosticSnapshot(doc, resolvedLoc);
+  const diagnostic = classifyPolimiFailure({
+    component: '@polisdk/poliauth/adapters/polimi-dom-adapter',
+    operation: 'submitOtp',
+    stage: 'otp',
+    url: getPageUrl(resolvedLoc),
+    pathname: resolvedLoc.pathname,
+    selectorOrEndpoint: POLIMI_LOGIN_FLOW_SPEC.otpPage.submitButtonSelector,
+    error: 'Could not locate 2FA OTP submit button.',
+    diagnosticSnapshot
+  });
+
   return {
     ok: false,
-    error: 'Could not locate 2FA OTP submit button.'
+    error: diagnostic.message,
+    diagnostic
   };
 }
 
-export type { PolimiPageStage };
+export { classifyPolimiFailure } from '../domain/entities.js';
+export type { PolimiPageStage, PolimiFailureClassificationInput } from '../domain/entities.js';

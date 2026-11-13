@@ -1,8 +1,12 @@
 import {
   POLIMI_LOGIN_FLOW_SPEC,
+  PoliAuthDiagnosticError,
+  classifyPolimiFailure,
+  type PolimiLoginFlowSpec,
   type PolimiStageInspectionResult,
   type FederatedSsoInspectionResult
 } from '@polisdk/poliauth/domain';
+import type { PolimiPageActionResult } from '@polisdk/poliauth/adapters';
 import type {
   AuthLoggerPort,
   FederatedAuthPageDriverPort,
@@ -89,12 +93,35 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
   private readonly page: PlaywrightPageLike;
   private readonly options: PlaywrightAuthPageDriverOptions;
   private readonly logger?: AuthLoggerPort;
+  private readonly flowSpec: PolimiLoginFlowSpec = POLIMI_LOGIN_FLOW_SPEC;
+  private lastNavigationHttpStatus?: number;
+  private lastNavigationUrl?: string;
 
   constructor(page: PlaywrightPageLike, options: PlaywrightAuthPageDriverOptions = {}) {
     this.page = page;
     this.options = options;
     this.federatedProviderId = options.federatedProviderSpec?.providerId ?? '';
     this.logger = options.logger ? createRedactingLogger(options.logger) : undefined;
+  }
+
+  private safeCurrentUrl(): string {
+    try {
+      return this.page.url() || '';
+    } catch {
+      return '';
+    }
+  }
+
+  private getCurrentHttpStatus(currentUrl: string): number | undefined {
+    if (this.lastNavigationHttpStatus === undefined) {
+      return undefined;
+    }
+    if (this.lastNavigationUrl && currentUrl && this.lastNavigationUrl !== currentUrl) {
+      this.lastNavigationHttpStatus = undefined;
+      this.lastNavigationUrl = undefined;
+      return undefined;
+    }
+    return this.lastNavigationHttpStatus;
   }
 
   /**
@@ -135,8 +162,21 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
       } catch (err) {
         const redacted = redactSensitiveErrorText(err);
         if (!isTransientNavigationError(err)) {
+          const currentUrl = this.safeCurrentUrl();
+          const diagnosticError =
+            err instanceof PoliAuthDiagnosticError
+              ? err
+              : new PoliAuthDiagnosticError(
+                  classifyPolimiFailure({
+                    component: '@polisdk/poliauth-playwright',
+                    operation: operationName,
+                    url: currentUrl,
+                    httpStatus: this.getCurrentHttpStatus(currentUrl),
+                    error: err
+                  })
+                );
           this.logger?.error(`Playwright ${operationName} failed: ${redacted}`);
-          throw err;
+          throw diagnosticError;
         }
         this.logger?.warn(
           `Transient navigation error during Playwright ${operationName} (attempt ${attempt}/${maxAttempts}): ${redacted}`
@@ -155,10 +195,45 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
   }
 
   async goto(url: string, timeoutMs?: number): Promise<void> {
-    await this.page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: timeoutMs ?? this.options.navigationTimeoutMs ?? 35_000
-    });
+    this.lastNavigationHttpStatus = undefined;
+    this.lastNavigationUrl = undefined;
+    try {
+      const response = await this.page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: timeoutMs ?? this.options.navigationTimeoutMs ?? 35_000
+      });
+      if (response && typeof response === 'object') {
+        const statusFn = (response as { status?: unknown }).status;
+        if (typeof statusFn === 'function') {
+          const numericStatus = Number((statusFn as () => unknown).call(response));
+          if (Number.isFinite(numericStatus) && numericStatus > 0) {
+            const urlFn = (response as { url?: unknown }).url;
+            const resolvedUrl =
+              typeof urlFn === 'function'
+                ? String((urlFn as () => unknown).call(response) || '')
+                : this.safeCurrentUrl();
+            this.lastNavigationHttpStatus = numericStatus;
+            this.lastNavigationUrl = resolvedUrl || url;
+          }
+        }
+      }
+    } catch (err) {
+      const diagnosticError =
+        err instanceof PoliAuthDiagnosticError
+          ? err
+          : new PoliAuthDiagnosticError(
+              classifyPolimiFailure({
+                component: '@polisdk/poliauth-playwright',
+                operation: 'goto',
+                stage: 'entry',
+                url,
+                selectorOrEndpoint: url,
+                error: err
+              })
+            );
+      this.logger?.error(`Playwright goto failed: ${diagnosticError.message}`);
+      throw diagnosticError;
+    }
   }
 
   async waitForNavigation(timeoutMs = 5_000): Promise<void> {
@@ -175,19 +250,42 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
 
   async inspectPolimiStage(): Promise<PolimiStageInspectionResult> {
     try {
-      return await this.evaluateWithRetry('inspectPolimiStage', () =>
-        this.page.evaluate(() => {
+      const currentUrl = this.safeCurrentUrl();
+      const httpStatus = this.getCurrentHttpStatus(currentUrl);
+      const inspection = await this.evaluateWithRetry('inspectPolimiStage', () =>
+        this.page.evaluate((status) => {
           const loc = {
             hostname: window.location.hostname,
             pathname: window.location.pathname,
             search: window.location.search,
             href: window.location.href
           };
-          return window.__PoliAuthAdapters!.polimi.inspectPolimiPageStage(document, loc);
-        })
+          return window.__PoliAuthAdapters!.polimi.inspectPolimiPageStage(
+            document,
+            loc,
+            status !== undefined ? { httpStatus: status } : undefined
+          );
+        }, httpStatus)
       );
+      if (inspection.stage === 'unknown' && !inspection.diagnosticError) {
+        const effectiveStatus = inspection.httpStatus ?? httpStatus;
+        const diagnosticError = classifyPolimiFailure({
+          component: '@polisdk/poliauth-playwright',
+          operation: 'inspectPolimiStage',
+          stage: 'unknown',
+          url: inspection.url || currentUrl,
+          httpStatus: effectiveStatus,
+          diagnosticSnapshot: inspection.diagnosticSnapshot
+        });
+        return {
+          ...inspection,
+          ...(effectiveStatus !== undefined ? { httpStatus: effectiveStatus } : {}),
+          diagnosticError
+        };
+      }
+      return inspection;
     } catch (err) {
-      if (!isTransientNavigationError(err)) {
+      if (err instanceof PoliAuthDiagnosticError || !isTransientNavigationError(err)) {
         throw err;
       }
       this.logger?.warn(
@@ -211,9 +309,9 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
       );
       if (!recovery.ok) {
         const targetUrl =
-          recovery.navigatedTo || POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
+          recovery.navigatedTo || this.flowSpec.entry.serviceEntryUrl;
         await this.goto(targetUrl);
-        return { ok: false, navigatedTo: targetUrl };
+        return { ok: true, navigatedTo: targetUrl };
       }
 
       if (typeof this.page.waitForURL === 'function') {
@@ -221,7 +319,7 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
           .waitForURL(
             (nextUrl) =>
               nextUrl.href !== beforeUrl ||
-              !nextUrl.pathname.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker),
+              !nextUrl.pathname.includes(this.flowSpec.entry.sessionTerminatedMarker),
             { timeout: 1_800, waitUntil: 'domcontentloaded' }
           )
           .catch(() => undefined);
@@ -231,41 +329,61 @@ export class PlaywrightAuthPageDriver implements FederatedAuthPageDriverPort {
       await this.waitForNavigation(1_800);
 
       if (
-        beforeUrl.includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker) &&
-        this.page.url().includes(POLIMI_LOGIN_FLOW_SPEC.entry.sessionTerminatedMarker)
+        beforeUrl.includes(this.flowSpec.entry.sessionTerminatedMarker) &&
+        this.page.url().includes(this.flowSpec.entry.sessionTerminatedMarker)
       ) {
         const targetUrl =
-          recovery.navigatedTo || POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
+          recovery.navigatedTo || this.flowSpec.entry.serviceEntryUrl;
         await this.goto(targetUrl);
         return { ok: false, navigatedTo: targetUrl };
       }
 
       return recovery;
     } catch (err) {
-      if (!isTransientNavigationError(err)) {
+      if (err instanceof PoliAuthDiagnosticError || !isTransientNavigationError(err)) {
         throw err;
       }
       this.logger?.warn(
         `Playwright recoverSessionPage interrupted by navigation; falling back to serviceEntryUrl: ${redactSensitiveErrorText(err)}`
       );
-      const fallbackUrl = POLIMI_LOGIN_FLOW_SPEC.entry.serviceEntryUrl;
+      const fallbackUrl = this.flowSpec.entry.serviceEntryUrl;
       await this.goto(fallbackUrl);
       return { ok: false, navigatedTo: fallbackUrl };
     }
   }
 
-  async submitCredentials(params: PolimiCredentialSubmission): Promise<PageActionResult> {
+  async submitCredentials(params: PolimiCredentialSubmission): Promise<PolimiPageActionResult> {
     return this.evaluateWithRetry('submitCredentials', () =>
       this.page.evaluate((creds) => {
-        return window.__PoliAuthAdapters!.polimi.submitPolimiCredentials(document, creds);
+        const loc = {
+          hostname: window.location.hostname,
+          pathname: window.location.pathname,
+          search: window.location.search,
+          href: window.location.href
+        };
+        return window.__PoliAuthAdapters!.polimi.submitPolimiCredentials(
+          document,
+          creds,
+          loc
+        );
       }, params)
     );
   }
 
-  async submitOtp(params: PolimiOtpSubmission): Promise<PageActionResult> {
+  async submitOtp(params: PolimiOtpSubmission): Promise<PolimiPageActionResult> {
     return this.evaluateWithRetry('submitOtp', () =>
       this.page.evaluate((p) => {
-        return window.__PoliAuthAdapters!.polimi.submitPolimiOtp(document, p);
+        const loc = {
+          hostname: window.location.hostname,
+          pathname: window.location.pathname,
+          search: window.location.search,
+          href: window.location.href
+        };
+        return window.__PoliAuthAdapters!.polimi.submitPolimiOtp(
+          document,
+          p,
+          loc
+        );
       }, params)
     );
   }

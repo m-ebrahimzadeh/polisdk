@@ -303,6 +303,10 @@ packages/
 - **Transient Context Destruction Guard & Logged Retries**: `PoliAuthOrchestrator`, `PlaywrightAuthPageDriver`, `ensureAuthAdaptersInjected`, and `ChromeExtensionTabDriver` catch transient `"Execution context was destroyed"` and navigation race errors during multi-hop HTTP 302 redirects, log redacted diagnostics via `AuthLoggerPort` + `redactSensitiveErrorText`, and retry deterministically with zero silent failures.
 - **Resource Management**: `PlaywrightBrowserSessionPool` guarantees LRU eviction of idle contexts, reference-counted locking during concurrent use, and background timer unreferencing (`unrefTimerIfSupported`) so background tasks do not block process termination.
 
+### 6.4 Outage vs. Selector Drift Disambiguation & Live Probe Verification
+- **Deterministic Failure Taxonomy (`TASK-6.2`)**: `classifyPolimiFailure`, `PoliAuthDiagnosticError`, and `POLIMI_LOGIN_FLOW_SPEC.maintenanceIndicators` deterministically separate `PORTAL_OUTAGE_OR_NETWORK_ERROR` (HTTP `500/502/503/504`, `ETIMEDOUT`/`ERR_*`, maintenance banners, empty response bodies) from `DOM_SELECTOR_DRIFT` (populated HTTP `200` known IdP hostnames with missing selectors), short-circuiting `PoliAuthOrchestrator` without spurious polling and redacting all diagnostic snapshots/URLs via `redactSecrets`.
+- **Stage 2 Button Priority & Live E2E Verification (`TASK-6.1B`)**: `POLIMI_LOGIN_FLOW_SPEC.otpPage.submitButtonSelector` prioritizes non-`#submit-dissms`, non-`.jaf-visually-hidden` `evn_continua` submit buttons while safely retaining `#submit-dissms` as a visible fallback (`findPreferredButton()`). Opt-in `npm run probe:live:auth` verified Stage 0 -> Recovery -> Stage 1 -> Stage 2 (`form#form_scelta2fa`) -> Stage 3 (`servizionline.polimi.it` `Portale.do`) end-to-end (`[FACT:LIVE]`) under strict 1-attempt anti-lockout guards and zero secret leakage.
+
 ---
 
 ## 7. Future Extension Recommendations
@@ -329,7 +333,7 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 | :--- | :---: | :---: | :--- |
 | **Modularity** | `3/10` | **`10/10`** | Monolithic codebase decomposed into 5 cleanly bounded packages. `@polisdk/poliauth` has zero runtime dependencies and can run in any modern JS engine. |
 | **Reusability** | `2/10` | **`10/10`** | Pure domain models, TOTP algorithms, and DOM adapters can be embedded in browser extensions, desktop apps, servers, or CLI tools without dragging in SQLite or Playwright. |
-| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 78 automated tests pass across 14 test files. |
+| **Maintainability** | `3/10` | **`10/10`** | Stateful application use cases (`application/`) are completely separated from stateless enterprise domain rules (`domain/`). All 87 automated tests pass across 14 test files. |
 | **Extensibility** | `4/10` | **`10/10`** | Pluggable SPI for federated SAML providers (`FederatedSsoProviderAdapterPort`), declarative JSON specs, pluggable storage adapters (`VaultStoragePort`), and custom resource authorization policies. |
 | **Clean Architecture Compliance** | `2/10` | **`10/10`** | Strict inward dependency direction. Domain has zero external imports. Ports and adapters completely abstract all I/O, database, and browser mechanics. Authentication stops strictly at `'authenticated'`. |
 
@@ -338,8 +342,9 @@ The clean hexagonal architecture established in PoliSDK enables rapid developmen
 ## 9. Monorepo Verification Summary
 
 ```text
-✅ Build:     npm run build      --> 5/5 packages compiled cleanly
-✅ Typecheck: npm run typecheck  --> 0 errors across entire workspace
-✅ Tests:     npm test           --> 14/14 test files passed, 78/78 tests passing
-✅ Live Probe: npm run probe:live --> 1/1 test file passed, 6/6 tests passing (Stage 0 + Stage 1 [FACT:LIVE])
+✅ Build:          npm run build           --> 5/5 packages compiled cleanly
+✅ Typecheck:      npm run typecheck       --> 0 errors across entire workspace
+✅ Tests:          npm test                --> 14/14 test files passed, 87/87 tests passing
+✅ Live Probe:     npm run probe:live      --> Stages 0 -> Recovery -> Stage 1 [FACT:LIVE]
+✅ Auth E2E Probe: npm run probe:live:auth --> Stages 0 -> 1 -> 2 (2FA OTP) -> 3 [FACT:LIVE]
 ```

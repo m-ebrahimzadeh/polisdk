@@ -8,6 +8,71 @@
  * (see `adapters/webex-sso-dom-adapter.ts` -> `WEBEX_SAML_FLOW_SPEC`).
  */
 
+/**
+ * Canonical structural contract for the Politecnico di Milano Identity Provider
+ * login flow and outage/maintenance detection indicators.
+ */
+export interface PolimiLoginFlowSpec {
+  readonly entry: {
+    readonly requestedUrl: string;
+    readonly serviceEntryUrl: string;
+    readonly onlineServicesShortcutUrl: string;
+    readonly ssoPortalServiceId: string;
+    readonly idpHostname: string;
+    readonly idpPathnameSubstring: string;
+    readonly sessionTerminatedMarker: string;
+    readonly sessionExpiredTextMarkers: readonly string[];
+    readonly sessionExpiredSelectors: {
+      readonly continueToPortalLink: string;
+      readonly fallbackContinueToPortalLink: string;
+      readonly logoutLink: string;
+      readonly dangerAlert: string;
+      readonly warningAlert: string;
+    };
+  };
+  readonly ssoHandoffPage: {
+    readonly formSelector: string;
+    readonly checkCookieInputSelector: string;
+  };
+  readonly credentialsPage: {
+    readonly titleSubstring: string;
+    readonly urlSubstrings: readonly string[];
+    readonly formSelector: string;
+    readonly cardSelector: string;
+    readonly personCodeInputSelector: string;
+    readonly passwordInputSelector: string;
+    readonly stayConnectedCheckboxSelector: string;
+    readonly submitButtonSelector: string;
+    readonly fallbackSubmitButtonSelector: string;
+    readonly errorAlertSelector: string;
+  };
+  readonly otpPage: {
+    readonly titleSubstring: string;
+    readonly urlSubstrings: readonly string[];
+    readonly formSelector: string;
+    readonly otpInputSelector: string;
+    readonly fallbackOtpInputSelector: string;
+    readonly submitButtonSelector: string;
+    readonly fallbackSubmitButtonSelector: string;
+    readonly errorAlertSelector: string;
+  };
+  readonly authenticatedSession: {
+    readonly portalHostname: string;
+    readonly portalPathnameSubstring: string;
+    readonly portalTitleSubstring: string;
+    readonly authenticatedDomSelectors: readonly string[];
+  };
+  readonly samlIdentityProvider: {
+    readonly transitHostnames: readonly string[];
+  };
+  readonly maintenanceIndicators: {
+    readonly httpStatusCodes: readonly number[];
+    readonly textPatterns: readonly string[];
+    readonly networkErrorPatterns: readonly string[];
+    readonly bannerSelectors: readonly string[];
+  };
+}
+
 export const POLIMI_LOGIN_FLOW_SPEC = {
   /**
    * Step 1: Initial entry URLs and session-expired recovery behavior.
@@ -88,8 +153,9 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
     otpInputSelector: 'input#otp[name="otp"], input[name="otp"]',
     fallbackOtpInputSelector: 'input#codice_otp[name="codice_otp"], input#codice_otp',
     submitButtonSelector:
-      'button#submit-dissms[name="evn_continua"], button[name="evn_continua"]:not(.jaf-visually-hidden)',
-    fallbackSubmitButtonSelector: 'button[name="evn_continua"]',
+      'button[name="evn_continua"]:not(#submit-dissms):not(.jaf-visually-hidden)',
+    fallbackSubmitButtonSelector:
+      'button#submit-dissms[name="evn_continua"]:not(.jaf-visually-hidden), button[name="evn_continua"]:not(.jaf-visually-hidden), button[name="evn_continua"]',
     errorAlertSelector: '.poli-messages .alert-danger .jaf-message'
   },
 
@@ -122,5 +188,41 @@ export const POLIMI_LOGIN_FLOW_SPEC = {
    */
   samlIdentityProvider: {
     transitHostnames: ['aunicalogin.polimi.it', 'shibidp.polimi.it', 'idp.polimi.it']
+  },
+
+  /**
+   * Step 6: Outage, Gateway & Scheduled Maintenance Signatures for Drift Disambiguation.
+   */
+  maintenanceIndicators: {
+    httpStatusCodes: [500, 502, 503, 504],
+    textPatterns: [
+      'manutenzione',
+      'maintenance',
+      'servizio temporaneamente non disponibile',
+      'bad gateway',
+      'service unavailable',
+      'gateway time-out',
+      'gateway timeout'
+    ],
+    networkErrorPatterns: [
+      'ETIMEDOUT',
+      'ECONNRESET',
+      'ECONNREFUSED',
+      'ENOTFOUND',
+      'EAI_AGAIN',
+      'ERR_NAME_NOT_RESOLVED',
+      'ERR_CONNECTION_TIMED_OUT',
+      'ERR_CONNECTION_REFUSED',
+      'ERR_INTERNET_DISCONNECTED',
+      'ERR_TUNNEL_CONNECTION_FAILED',
+      'ERR_NETWORK_CHANGED',
+      'net::ERR_'
+    ],
+    bannerSelectors: [
+      '.poli-messages .alert-warning .jaf-message',
+      '.poli-messages .alert-danger .jaf-message',
+      '.alert-warning',
+      '.maintenance-banner'
+    ]
   }
-} as const;
+} as const satisfies PolimiLoginFlowSpec;
